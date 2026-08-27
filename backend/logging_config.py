@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import contextvars
+import fcntl
 import json
 import logging
 import math
 import os
 import re
+import shutil
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +42,13 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 _request_id = contextvars.ContextVar("request_id", default=None)
 _conversation_id = contextvars.ContextVar("conversation_id", default=None)
+
+ACTIVE_LOG_FILES = {
+    "backend.jsonl",
+    "uvicorn.jsonl",
+    "vite.jsonl",
+    "browser.jsonl",
+}
 
 
 @dataclass(frozen=True)
@@ -83,6 +94,20 @@ class LoggingSettings:
             "browser_queue_limit": self.browser_queue_limit,
             "event_max_bytes": self.event_max_bytes,
         }
+
+
+@dataclass(frozen=True)
+class RunContext:
+    run_id: str
+    run_dir: Path
+    latest_link: Path
+
+
+@dataclass(frozen=True)
+class CleanupAction:
+    path: str
+    reason: str
+    bytes_removed: int
 
 
 @dataclass(frozen=True)
@@ -135,8 +160,15 @@ def log_event(logger: logging.Logger, level: int, event: str, message: str, **fi
 class JsonLineFormatter(logging.Formatter):
     """Format records as one ANSI-free, safe JSON object per line."""
 
-    def __init__(self, *, run_id: str | None = None, event_max_bytes: int = 65536) -> None:
+    def __init__(
+        self,
+        *,
+        source: str | None = None,
+        run_id: str | None = None,
+        event_max_bytes: int = 65536,
+    ) -> None:
         super().__init__()
+        self.source = source
         self.run_id = run_id
         self.event_max_bytes = event_max_bytes
 
@@ -147,6 +179,7 @@ class JsonLineFormatter(logging.Formatter):
         payload: dict[str, Any] = {
             "timestamp": timestamp,
             "level": record.levelname,
+            "source": self.source,
             "logger": record.name,
             "event": redact(getattr(record, "event_name", "log.message")),
             "message": redact(record.getMessage()),
@@ -188,6 +221,231 @@ class ConsoleFormatter(logging.Formatter):
         elif record.exc_text:
             line = f"{line}\n{redact(record.exc_text)}"
         return _clean_string(line)
+
+
+class _CleanupRotatingFileHandler(RotatingFileHandler):
+    """Run retention after rollover completes and the handler lock is released."""
+
+    def __init__(self, *args: Any, rollover_callback: Callable[[], None], **kwargs: Any) -> None:
+        self._rollover_callback = rollover_callback
+        self._did_rollover = False
+        super().__init__(*args, **kwargs)
+
+    def doRollover(self) -> None:
+        super().doRollover()
+        self._did_rollover = True
+
+    def handle(self, record: logging.LogRecord) -> bool:
+        handled = self.filter(record)
+        did_rollover = False
+        if handled:
+            self.acquire()
+            try:
+                self._did_rollover = False
+                self.emit(record)
+                did_rollover = self._did_rollover
+            finally:
+                self._did_rollover = False
+                self.release()
+            if did_rollover:
+                try:
+                    self._rollover_callback()
+                except Exception:
+                    self.handleError(record)
+        return handled
+
+
+@contextmanager
+def retention_lock(log_dir: Path):
+    log_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = log_dir / ".retention.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def create_run_context(settings: LoggingSettings, now: datetime | None = None) -> RunContext:
+    current = now or datetime.now(timezone.utc)
+    run_id = current.astimezone(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    runs_dir = settings.log_dir / "runs"
+    run_dir = runs_dir / run_id
+    suffix = 1
+    while run_dir.exists():
+        run_dir = runs_dir / f"{run_id}-{suffix}"
+        suffix += 1
+    run_dir.mkdir(parents=True)
+    latest = settings.log_dir / "latest"
+    temporary = settings.log_dir / ".latest.tmp"
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(run_dir.relative_to(settings.log_dir), target_is_directory=True)
+    os.replace(temporary, latest)
+    return RunContext(run_dir.name, run_dir, latest)
+
+
+def configure_source_logger(
+    name: str,
+    source: str,
+    path: Path,
+    level: str,
+    run_id: str,
+    settings: LoggingSettings,
+    include_console: bool,
+) -> logging.Logger:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(name)
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+    logger.setLevel(level)
+    logger.propagate = False
+
+    file_handler = _CleanupRotatingFileHandler(
+        path,
+        maxBytes=settings.max_bytes,
+        backupCount=100,
+        encoding="utf-8",
+        delay=True,
+        rollover_callback=lambda: cleanup_logs(settings, path.parent),
+    )
+    file_handler.setLevel(level)
+    file_handler.setFormatter(
+        JsonLineFormatter(
+            source=source,
+            run_id=run_id,
+            event_max_bytes=settings.event_max_bytes,
+        )
+    )
+    logger.addHandler(file_handler)
+
+    if include_console:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        console_handler.setFormatter(ConsoleFormatter())
+        logger.addHandler(console_handler)
+    return logger
+
+
+def cleanup_logs(
+    settings: LoggingSettings,
+    current_run_dir: Path,
+    now: datetime | None = None,
+) -> list[CleanupAction]:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    actions: list[CleanupAction] = []
+    with retention_lock(settings.log_dir):
+        runs_dir = settings.log_dir / "runs"
+        if not runs_dir.is_dir():
+            return actions
+
+        protected_runs = {_absolute_path(current_run_dir)}
+        latest = settings.log_dir / "latest"
+        if latest.is_symlink():
+            try:
+                protected_runs.add(_absolute_path(latest.resolve(strict=True)))
+            except FileNotFoundError:
+                pass
+
+        completed_runs = _completed_run_dirs(runs_dir, protected_runs)
+        cutoff = current - timedelta(days=settings.retention_days)
+        for run_dir in completed_runs:
+            if _run_timestamp(run_dir) >= cutoff:
+                continue
+            actions.append(_remove_run(run_dir, "expired"))
+
+        total_bytes = _tree_size(runs_dir)
+        completed_runs = _completed_run_dirs(runs_dir, protected_runs)
+        for run_dir in completed_runs:
+            if total_bytes <= settings.total_max_bytes:
+                break
+            action = _remove_run(run_dir, "size_cap")
+            actions.append(action)
+            total_bytes -= action.bytes_removed
+
+        active_segments = _active_rotated_segments(current_run_dir)
+        for segment in active_segments:
+            if total_bytes <= settings.total_max_bytes:
+                break
+            bytes_removed = _tree_size(segment)
+            try:
+                segment.unlink()
+            except FileNotFoundError:
+                continue
+            actions.append(
+                CleanupAction(
+                    path=str(segment),
+                    reason="active_segment_size_cap",
+                    bytes_removed=bytes_removed,
+                )
+            )
+            total_bytes -= bytes_removed
+    return actions
+
+
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
+def _completed_run_dirs(runs_dir: Path, protected_runs: set[Path]) -> list[Path]:
+    run_dirs = [
+        path
+        for path in runs_dir.iterdir()
+        if not path.is_symlink()
+        and path.is_dir()
+        and _absolute_path(path) not in protected_runs
+    ]
+    return sorted(run_dirs, key=lambda path: (_run_timestamp(path), path.name))
+
+
+def _run_timestamp(run_dir: Path) -> datetime:
+    try:
+        return datetime.strptime(run_dir.name[:20], "%Y-%m-%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return datetime.fromtimestamp(
+            run_dir.stat(follow_symlinks=False).st_mtime,
+            tz=timezone.utc,
+        )
+
+
+def _remove_run(run_dir: Path, reason: str) -> CleanupAction:
+    bytes_removed = _tree_size(run_dir)
+    shutil.rmtree(run_dir)
+    return CleanupAction(str(run_dir), reason, bytes_removed)
+
+
+def _tree_size(path: Path) -> int:
+    try:
+        if path.is_symlink():
+            return 0
+        if path.is_file():
+            return path.stat(follow_symlinks=False).st_size
+        if not path.is_dir():
+            return 0
+        return sum(_tree_size(child) for child in path.iterdir())
+    except FileNotFoundError:
+        return 0
+
+
+def _active_rotated_segments(current_run_dir: Path) -> list[Path]:
+    segments: list[Path] = []
+    if not current_run_dir.is_dir() or current_run_dir.is_symlink():
+        return segments
+    for path in current_run_dir.iterdir():
+        if path.is_symlink() or not path.is_file():
+            continue
+        for base_name in ACTIVE_LOG_FILES:
+            prefix = f"{base_name}."
+            if path.name.startswith(prefix) and path.name[len(prefix) :].isdigit():
+                segments.append(path)
+                break
+    return sorted(
+        segments,
+        key=lambda path: (path.stat(follow_symlinks=False).st_mtime_ns, path.name),
+    )
 
 
 def _settings_from_mapping(values: Mapping[str, str], warning_sink: Callable[[str], None]) -> LoggingSettings:
