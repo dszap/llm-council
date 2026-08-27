@@ -172,6 +172,8 @@ class JsonLineFormatter(logging.Formatter):
         event_max_bytes: int = 65536,
     ) -> None:
         super().__init__()
+        if event_max_bytes < 2:
+            raise ValueError("event_max_bytes must be at least 2")
         self.source = source
         self.run_id = run_id
         self.event_max_bytes = event_max_bytes
@@ -201,11 +203,7 @@ class JsonLineFormatter(logging.Formatter):
                 if key not in payload:
                     payload[key] = value
         safe_payload = _normalize_non_finite(_truncate_fields(redact(payload), self.event_max_bytes))
-        # Extremely tiny limits are retained in the historical per-string
-        # truncation mode; practical configured limits enforce the aggregate
-        # serialized-byte bound below.
-        if self.event_max_bytes >= 64:
-            safe_payload = _fit_payload(safe_payload, self.event_max_bytes)
+        safe_payload = _fit_payload(safe_payload, self.event_max_bytes)
         return _serialize_payload(safe_payload)
 
 
@@ -512,7 +510,13 @@ def _settings_from_mapping(values: Mapping[str, str], warning_sink: Callable[[st
         browser_batch_size=_parse_positive_int(values, "LOG_BROWSER_BATCH_SIZE", defaults.browser_batch_size, warning_sink),
         browser_flush_ms=_parse_positive_int(values, "LOG_BROWSER_FLUSH_MS", defaults.browser_flush_ms, warning_sink),
         browser_queue_limit=_parse_positive_int(values, "LOG_BROWSER_QUEUE_LIMIT", defaults.browser_queue_limit, warning_sink),
-        event_max_bytes=_parse_positive_int(values, "LOG_EVENT_MAX_BYTES", defaults.event_max_bytes, warning_sink),
+        event_max_bytes=_parse_positive_int(
+            values,
+            "LOG_EVENT_MAX_BYTES",
+            defaults.event_max_bytes,
+            warning_sink,
+            minimum=2,
+        ),
     )
 
 
@@ -527,7 +531,14 @@ def _parse_level(values: Mapping[str, str], name: str, default: str, warning_sin
     return default
 
 
-def _parse_positive_int(values: Mapping[str, str], name: str, default: int, warning_sink: Callable[[str], None]) -> int:
+def _parse_positive_int(
+    values: Mapping[str, str],
+    name: str,
+    default: int,
+    warning_sink: Callable[[str], None],
+    *,
+    minimum: int = 1,
+) -> int:
     value = values.get(name)
     if value is None:
         return default
@@ -536,7 +547,7 @@ def _parse_positive_int(values: Mapping[str, str], name: str, default: int, warn
     except (TypeError, ValueError):
         _warn_invalid(name, warning_sink)
         return default
-    if parsed <= 0:
+    if parsed < minimum:
         _warn_invalid(name, warning_sink)
         return default
     return parsed
@@ -731,7 +742,10 @@ def _fit_payload(value: Mapping[str, Any], max_bytes: int) -> dict[str, Any]:
     fallback = {"message": "[truncated]"}
     if len(_serialize_payload(fallback).encode("utf-8")) <= max_bytes:
         return fallback
-    return {"message": ""}
+    empty_payload: dict[str, Any] = {}
+    if len(_serialize_payload(empty_payload).encode("utf-8")) <= max_bytes:
+        return empty_payload
+    raise ValueError("max_bytes cannot contain a JSON object")
 
 
 def _redact_string(value: str) -> str:

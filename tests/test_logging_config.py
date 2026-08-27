@@ -37,6 +37,15 @@ class LoggingSettingsTests(unittest.TestCase):
         self.assertEqual(settings.browser_level, "WARNING")
         self.assertEqual(len(warnings), 2)
 
+    def test_event_limit_below_minimum_falls_back_safely(self):
+        warnings = []
+        settings = LoggingSettings.from_env(
+            {"LOG_EVENT_MAX_BYTES": "1"}, warning_sink=warnings.append
+        )
+        self.assertEqual(settings.event_max_bytes, 65536)
+        self.assertEqual(len(warnings), 1)
+        self.assertNotIn("1", warnings[0])
+
     def test_payload_logging_only_accepts_literal_true(self):
         warnings = []
         for value in ("1", "yes", "on"):
@@ -184,14 +193,9 @@ class RedactionTests(unittest.TestCase):
         finally:
             reset_log_context(tokens)
 
-        payload = json.loads(stream.getvalue())
-        self.assertTrue(self._has_truncation_metadata(payload, "message"))
-        self.assertTrue(self._has_truncation_metadata(payload, "exceptio"))
-        self.assertTrue(self._has_truncation_metadata(payload["outer"], "nested"))
-        self.assertTrue(self._has_truncation_metadata(payload, "items"))
-        self.assertLessEqual(len(payload["items"][0].encode("utf-8")), 8)
-        self._assert_string_values_within(payload, 8)
-        self._assert_mapping_keys_within(payload, 8)
+        serialized = stream.getvalue().rstrip("\n")
+        self.assertLessEqual(len(serialized.encode("utf-8")), 8)
+        json.loads(serialized)
 
     def test_json_formatter_preserves_named_metadata_when_it_fits(self):
         stream = io.StringIO()
@@ -227,27 +231,22 @@ class RedactionTests(unittest.TestCase):
             self.assertLessEqual(len(serialized.encode("utf-8")), max_bytes)
             json.loads(serialized)
 
-    def _has_truncation_metadata(self, value, field):
-        return any(entry[0] == field and entry[1] == 1 for entry in value["_"])
+    def test_json_formatter_caps_complete_payload_at_small_supported_limits(self):
+        for max_bytes in (2, 8, 16, 32, 63):
+            stream = io.StringIO()
+            handler = logging.StreamHandler(stream)
+            handler.setFormatter(JsonLineFormatter(event_max_bytes=max_bytes))
+            logger = logging.getLogger(f"test.logging.small_limit.{max_bytes}")
+            logger.handlers = [handler]
+            logger.propagate = False
+            logger.setLevel(logging.INFO)
+            log_event(logger, logging.INFO, "oversized.event", "x" * 500)
+            serialized = stream.getvalue().rstrip("\n")
+            self.assertLessEqual(len(serialized.encode("utf-8")), max_bytes)
+            json.loads(serialized)
 
-    def _assert_string_values_within(self, value, max_bytes):
-        if isinstance(value, dict):
-            for item in value.values():
-                self._assert_string_values_within(item, max_bytes)
-        elif isinstance(value, list):
-            for item in value:
-                self._assert_string_values_within(item, max_bytes)
-        elif isinstance(value, str):
-            self.assertLessEqual(len(value.encode("utf-8")), max_bytes)
-
-    def _assert_mapping_keys_within(self, value, max_bytes):
-        if isinstance(value, dict):
-            for key, item in value.items():
-                self.assertLessEqual(len(key.encode("utf-8")), max_bytes)
-                self._assert_mapping_keys_within(item, max_bytes)
-        elif isinstance(value, list):
-            for item in value:
-                self._assert_mapping_keys_within(item, max_bytes)
+        with self.assertRaises(ValueError):
+            JsonLineFormatter(event_max_bytes=1)
 
 
 class JsonFormatterTests(unittest.TestCase):
