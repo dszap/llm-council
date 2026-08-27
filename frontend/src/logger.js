@@ -10,33 +10,60 @@ function truncateBrowserText(value, maxBytes) {
   return `${new TextDecoder().decode(encoded.slice(0, maxBytes))}[truncated:${encoded.byteLength}]`;
 }
 
+function sanitizeBrowserPage(value) {
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return String(value).split(/[?#]/, 1)[0];
+  }
+}
+
+function serializedEventBytes(event) {
+  return new TextEncoder().encode(JSON.stringify(event)).byteLength;
+}
+
+function compactEventField(event, field, eventMaxBytes) {
+  const original = event[field];
+  const originalBytes = new TextEncoder().encode(original).byteLength;
+  const suffix = `[truncated:${originalBytes}]`;
+  let low = 0;
+  let high = original.length;
+  let compacted = '';
+
+  event[field] = '';
+  if (serializedEventBytes(event) > eventMaxBytes) return false;
+
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = middle === original.length
+      ? original
+      : `${original.slice(0, middle)}${suffix}`;
+    event[field] = candidate;
+    if (serializedEventBytes(event) <= eventMaxBytes) {
+      compacted = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  event[field] = compacted;
+  return true;
+}
+
 function truncateBrowserEvent(event, eventMaxBytes) {
-  if (new TextEncoder().encode(JSON.stringify(event)).byteLength <= eventMaxBytes) return event;
+  if (!Number.isInteger(eventMaxBytes) || eventMaxBytes <= 0) return null;
+  if (serializedEventBytes(event) <= eventMaxBytes) return event;
 
   const truncatedEvent = {
     ...event,
     message: '',
     details: { truncated: true },
   };
-  const originalBytes = new TextEncoder().encode(event.message).byteLength;
-  const suffix = `[truncated:${originalBytes}]`;
-  let low = 0;
-  let high = event.message.length;
-  let message = suffix;
-
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2);
-    const candidate = `${event.message.slice(0, middle)}${suffix}`;
-    truncatedEvent.message = candidate;
-    if (new TextEncoder().encode(JSON.stringify(truncatedEvent)).byteLength <= eventMaxBytes) {
-      message = candidate;
-      low = middle + 1;
-    } else {
-      high = middle - 1;
-    }
-  }
-  truncatedEvent.message = message;
-  return truncatedEvent;
+  if (!compactEventField(truncatedEvent, 'page', eventMaxBytes)) return null;
+  if (serializedEventBytes(truncatedEvent) <= eventMaxBytes) return truncatedEvent;
+  if (!compactEventField(truncatedEvent, 'message', eventMaxBytes)) return null;
+  return serializedEventBytes(truncatedEvent) <= eventMaxBytes ? truncatedEvent : null;
 }
 
 export function sanitizeBrowserValue(value, { eventMaxBytes, seen }) {
@@ -126,7 +153,7 @@ export function createBrowserLogger(options) {
       event,
       message: safe.message,
       browser_session_id: sessionId,
-      page: windowObject.location.href,
+      page: sanitizeBrowserPage(windowObject.location.href),
       details: safe.details,
     }, eventMaxBytes);
   }
@@ -140,7 +167,8 @@ export function createBrowserLogger(options) {
   function log(eventLevel, event, message, details = {}) {
     try {
       if (!enabled(eventLevel)) return;
-      enqueue(buildEvent(eventLevel, event, message, details));
+      const eventPayload = buildEvent(eventLevel, event, message, details);
+      if (eventPayload) enqueue(eventPayload);
     } catch {
       // Logging must never change application behavior.
     }

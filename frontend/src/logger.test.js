@@ -248,3 +248,68 @@ test('console capture cannot throw for an unstringifiable argument', () => {
   logger.stop();
   assert.equal(originalErrors.length, 1);
 });
+
+test('removes query parameters and fragments from browser page events', async () => {
+  const sent = [];
+  const windowObject = createFakeWindow();
+  windowObject.location.href = 'https://council.example/conversations/42?api_key=api-secret-value&token=token-secret-value#access_token=fragment-secret';
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject,
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+  logger.log('ERROR', 'page.event', 'failure');
+  await logger.flush();
+  const serialized = JSON.stringify(sent);
+  assert.equal(sent[0].events[0].page, 'https://council.example/conversations/42');
+  assert.doesNotMatch(serialized, /api-secret-value|token-secret-value|fragment-secret/);
+});
+
+test('caps long-page events and drops events below the metadata floor', async () => {
+  const sent = [];
+  const windowObject = createFakeWindow();
+  windowObject.location.href = `https://council.example/${'x'.repeat(1000)}?token=secret-value`;
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 256,
+    windowObject,
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+  logger.log('ERROR', 'page.event', 'failure');
+  await logger.flush();
+  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0].events[0])).byteLength <= 256);
+  assert.match(sent[0].events[0].page, /^https:\/\/council\.example\//);
+
+  const tinySent = [];
+  const tinyLogger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 1,
+    windowObject,
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => tinySent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+  tinyLogger.log('ERROR', 'tiny.event', 'failure');
+  await tinyLogger.flush();
+  assert.equal(tinySent.length, 0);
+});
