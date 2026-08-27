@@ -247,7 +247,19 @@ class HttpLoggingTests(unittest.TestCase):
         self.assertEqual(payload["request_id"], request_id)
         self.assertEqual(payload["conversation_id"], response.json()["id"])
 
-    def test_logging_setup_falls_back_when_delayed_file_open_fails(self):
+    def test_logging_setup_falls_back_when_delayed_file_write_fails(self):
+        class WriteFailureStream:
+            def write(self, value):
+                if value:
+                    raise OSError("write denied")
+                return 0
+
+            def flush(self):
+                return None
+
+            def close(self):
+                return None
+
         logger_names = (
             "llm_council.backend",
             "llm_council.browser",
@@ -279,7 +291,7 @@ class HttpLoggingTests(unittest.TestCase):
                 clear=False,
             ), patch(
                 "backend.logging_config._CleanupRotatingFileHandler._open",
-                side_effect=OSError("write denied"),
+                return_value=WriteFailureStream(),
             ), patch("backend.main.log_event"):
                 main._configure_logging()
                 self.assertFalse(

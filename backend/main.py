@@ -375,7 +375,20 @@ def _validate_file_targets(*loggers: logging.Logger) -> None:
             try:
                 if handler.stream is None:
                     handler.stream = handler._open()
-                handler.stream.write("")
+                record = logger.makeRecord(
+                    logger.name,
+                    logging.INFO,
+                    __file__,
+                    0,
+                    "Logging target validated",
+                    (),
+                    None,
+                    extra={
+                        "event_name": "logging.target.validated",
+                        "event_fields": {},
+                    },
+                )
+                handler.stream.write(f"{handler.format(record)}\n")
                 handler.stream.flush()
             finally:
                 handler.release()
