@@ -417,10 +417,17 @@ def _close_logger_handlers(*names: str) -> None:
 
 
 def _sanitize_browser_page(value: str) -> str:
-    """Remove browser URL userinfo, query parameters, and fragments."""
-    parts = urlsplit(str(value))
-    netloc = parts.netloc.rsplit("@", 1)[-1]
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    """Return a credential/query/fragment-free page without raising."""
+    raw = str(value)
+    try:
+        parts = urlsplit(raw)
+        netloc = parts.netloc.rsplit("@", 1)[-1]
+        sanitized = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    except (TypeError, ValueError):
+        sanitized = raw.split("?", 1)[0].split("#", 1)[0]
+        if "@" in sanitized:
+            sanitized = sanitized.rsplit("@", 1)[-1]
+    return sanitized[:2048] or "/"
 
 
 class _UvicornAccessRecordFilter(logging.Filter):

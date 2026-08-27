@@ -145,6 +145,41 @@ class HttpLoggingTests(unittest.TestCase):
         self.assertEqual(payload["details"]["nested"]["authorization"], "[REDACTED]")
         self.assertNotIn("secret-value", stream.getvalue())
 
+    def test_browser_ingestion_degrades_safely_for_malformed_pages(self):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(JsonLineFormatter(source="browser", run_id="test-run"))
+        logger = logging.getLogger("llm_council.browser")
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG)
+        try:
+            response = self.client.post(
+                "/api/logs/browser",
+                headers={"Origin": "http://localhost:5173"},
+                json={
+                    "events": [{
+                        "client_timestamp": "2026-08-26T22:07:12.438Z",
+                        "level": "ERROR",
+                        "event": "browser.malformed_page",
+                        "message": "boom",
+                        "browser_session_id": "session-1",
+                        "page": "https://user:password@[::1?token=secret#fragment",
+                    }],
+                },
+            )
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
+        self.assertEqual(response.status_code, 202)
+        payload = json.loads(stream.getvalue())
+        self.assertNotIn("token=secret", payload["page"])
+        self.assertNotIn("fragment", payload["page"])
+
     def test_rejects_untrusted_origin_and_oversized_batch(self):
         event = {
             "client_timestamp": "2026-08-26T22:07:12.438Z",
