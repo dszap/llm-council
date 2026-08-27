@@ -232,7 +232,7 @@ class RedactionTests(unittest.TestCase):
             json.loads(serialized)
 
     def test_json_formatter_caps_complete_payload_at_small_supported_limits(self):
-        for max_bytes in (2, 8, 16, 32, 63):
+        for max_bytes in (2, 8, 14, 16, 24, 32, 63):
             stream = io.StringIO()
             handler = logging.StreamHandler(stream)
             handler.setFormatter(JsonLineFormatter(event_max_bytes=max_bytes))
@@ -243,7 +243,10 @@ class RedactionTests(unittest.TestCase):
             log_event(logger, logging.INFO, "oversized.event", "x" * 500)
             serialized = stream.getvalue().rstrip("\n")
             self.assertLessEqual(len(serialized.encode("utf-8")), max_bytes)
-            json.loads(serialized)
+            payload = json.loads(serialized)
+            if max_bytes in (14, 16, 24):
+                self.assertIn("message", payload)
+                self.assertTrue(("x" * 500).startswith(payload["message"]))
 
         with self.assertRaises(ValueError):
             JsonLineFormatter(event_max_bytes=1)

@@ -739,6 +739,22 @@ def _fit_payload(value: Mapping[str, Any], max_bytes: int) -> dict[str, Any]:
         if len(_serialize_payload(compacted).encode("utf-8")) <= max_bytes:
             return compacted
 
+    # Retain as much of the message as the compact object shape permits.
+    message = candidate.get("message")
+    if isinstance(message, str):
+        low, high = 0, max_bytes
+        best_message: dict[str, Any] | None = None
+        while low <= high:
+            middle = (low + high) // 2
+            compacted = {"message": truncate_utf8(message, middle)[0]}
+            if len(_serialize_payload(compacted).encode("utf-8")) <= max_bytes:
+                best_message = compacted
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best_message is not None:
+            return best_message
+
     fallback = {"message": "[truncated]"}
     if len(_serialize_payload(fallback).encode("utf-8")) <= max_bytes:
         return fallback
