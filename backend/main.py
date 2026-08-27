@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import storage
@@ -99,7 +99,12 @@ async def correlate_request(request: Request, call_next):
             path=request.url.path,
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
         )
-        raise
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"},
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
     finally:
         reset_log_context(tokens)
 
@@ -192,11 +197,14 @@ async def list_conversations():
 
 
 @app.post("/api/conversations", response_model=Conversation)
-async def create_conversation(request: CreateConversationRequest):
+async def create_conversation(request: CreateConversationRequest, http_request: Request):
     """Create a new conversation."""
     conversation_id = str(uuid.uuid4())
-    conversation = storage.create_conversation(conversation_id)
-    return conversation
+    tokens = bind_log_context(http_request.state.request_id, conversation_id)
+    try:
+        return storage.create_conversation(conversation_id)
+    finally:
+        reset_log_context(tokens)
 
 
 @app.get("/api/conversations/{conversation_id}", response_model=Conversation)
@@ -357,6 +365,35 @@ def _configure_console_logger(name: str, level: str) -> logging.Logger:
     return logger
 
 
+def _validate_file_targets(*loggers: logging.Logger) -> None:
+    """Open and flush delayed file targets while setup errors can still recover."""
+    for logger in loggers:
+        for handler in logger.handlers:
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            handler.acquire()
+            try:
+                if handler.stream is None:
+                    handler.stream = handler._open()
+                handler.stream.write("")
+                handler.stream.flush()
+            finally:
+                handler.release()
+
+
+def _close_logger_handlers(*names: str) -> None:
+    """Remove and close partially configured handlers without double-closing."""
+    closed_handlers: set[int] = set()
+    for name in names:
+        logger = logging.getLogger(name)
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler_id = id(handler)
+            if handler_id not in closed_handlers:
+                handler.close()
+                closed_handlers.add(handler_id)
+
+
 def _configure_logging() -> None:
     """Configure separate backend, browser, and Uvicorn JSONL log sources."""
     global backend_logger, browser_logger
@@ -399,6 +436,7 @@ def _configure_logging() -> None:
             settings,
             include_console=True,
         )
+        _validate_file_targets(backend_logger, browser_logger, uvicorn_logger)
         http_logger.handlers = backend_logger.handlers[:]
         http_logger.setLevel(settings.backend_level)
         http_logger.propagate = False
@@ -409,6 +447,14 @@ def _configure_logging() -> None:
             logger.propagate = True
         uvicorn_logger.propagate = False
     except OSError:
+        _close_logger_handlers(
+            "llm_council.backend",
+            "llm_council.browser",
+            "llm_council.http",
+            "uvicorn",
+            "uvicorn.error",
+            "uvicorn.access",
+        )
         backend_logger = _configure_console_logger(
             "llm_council.backend", settings.backend_level
         )

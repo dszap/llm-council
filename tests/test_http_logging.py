@@ -1,11 +1,14 @@
 import io
 import json
 import logging
+import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
+from backend import main
 from backend.logging_config import JsonLineFormatter, log_event
 from backend.main import app
 
@@ -27,12 +30,36 @@ class HttpLoggingTests(unittest.TestCase):
         response = self.client.get("/", headers={"X-Request-ID": request_id})
         self.assertEqual(response.headers["x-request-id"], request_id)
 
+    def test_unhandled_failure_returns_request_id(self):
+        request_id = "28e8f443-7eb8-41e4-8ca6-79689b13d36d"
+        logger = logging.getLogger("llm_council.http")
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
+        logger.handlers = [logging.NullHandler()]
+        logger.propagate = False
+        try:
+            with patch(
+                "backend.main.storage.list_conversations", side_effect=RuntimeError("boom")
+            ):
+                response = TestClient(app, raise_server_exceptions=False).get(
+                    "/api/conversations", headers={"X-Request-ID": request_id}
+                )
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.headers["x-request-id"], request_id)
+
     def test_browser_batch_is_logged_with_server_owned_source(self):
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
-        handler.setFormatter(logging.Formatter("%(event_name)s|%(message)s"))
+        handler.setFormatter(JsonLineFormatter(source="browser", run_id="test-run"))
         logger = logging.getLogger("llm_council.browser")
         original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
         logger.handlers = [handler]
         logger.propagate = False
         logger.setLevel(logging.DEBUG)
@@ -49,15 +76,25 @@ class HttpLoggingTests(unittest.TestCase):
                             "message": "boom",
                             "browser_session_id": "session-1",
                             "page": "http://localhost:5173/",
-                            "details": {"authorization": "Bearer secret-value"},
+                            "details": {
+                                "source": "attacker-controlled",
+                                "nested": {"authorization": "Bearer secret-value"},
+                            },
                         }
                     ]
                 },
             )
         finally:
             logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
         self.assertEqual(response.status_code, 202)
-        self.assertIn("browser.unhandled_error|boom", stream.getvalue())
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(payload["source"], "browser")
+        self.assertEqual(payload["level"], "ERROR")
+        self.assertEqual(payload["event"], "browser.unhandled_error")
+        self.assertEqual(payload["details"]["source"], "attacker-controlled")
+        self.assertEqual(payload["details"]["nested"]["authorization"], "[REDACTED]")
         self.assertNotIn("secret-value", stream.getvalue())
 
     def test_rejects_untrusted_origin_and_oversized_batch(self):
@@ -88,6 +125,8 @@ class HttpLoggingTests(unittest.TestCase):
         handler.setFormatter(JsonLineFormatter(run_id="test-run"))
         logger = logging.getLogger("llm_council.backend")
         original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
         logger.handlers = [handler]
         logger.propagate = False
         logger.setLevel(logging.INFO)
@@ -113,6 +152,8 @@ class HttpLoggingTests(unittest.TestCase):
                 )
         finally:
             logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
         self.assertEqual(response.status_code, 200)
         payload = json.loads(stream.getvalue())
         self.assertEqual(payload["request_id"], request_id)
@@ -124,6 +165,8 @@ class HttpLoggingTests(unittest.TestCase):
         handler.setFormatter(JsonLineFormatter(run_id="test-run"))
         logger = logging.getLogger("llm_council.backend")
         original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
         logger.handlers = [handler]
         logger.propagate = False
         logger.setLevel(logging.INFO)
@@ -157,7 +200,111 @@ class HttpLoggingTests(unittest.TestCase):
                     body = "".join(response.iter_text())
         finally:
             logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
         self.assertIn('"type": "complete"', body)
         payload = json.loads(stream.getvalue())
         self.assertEqual(payload["request_id"], request_id)
         self.assertEqual(payload["conversation_id"], conversation_id)
+
+    def test_create_conversation_binds_request_and_generated_conversation_ids(self):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(JsonLineFormatter(run_id="test-run"))
+        logger = logging.getLogger("llm_council.backend")
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+
+        def create_and_log(conversation_id):
+            log_event(logger, logging.INFO, "test.conversation.created", "Created")
+            return {
+                "id": conversation_id,
+                "created_at": "2026-08-27T00:00:00Z",
+                "title": "New Conversation",
+                "messages": [],
+            }
+
+        request_id = "28e8f443-7eb8-41e4-8ca6-79689b13d36d"
+        try:
+            with patch(
+                "backend.main.storage.create_conversation", side_effect=create_and_log
+            ):
+                response = self.client.post(
+                    "/api/conversations",
+                    headers={"X-Request-ID": request_id},
+                    json={},
+                )
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(payload["request_id"], request_id)
+        self.assertEqual(payload["conversation_id"], response.json()["id"])
+
+    def test_logging_setup_falls_back_when_delayed_file_open_fails(self):
+        logger_names = (
+            "llm_council.backend",
+            "llm_council.browser",
+            "llm_council.http",
+            "uvicorn",
+            "uvicorn.error",
+            "uvicorn.access",
+        )
+        logger_state = {
+            name: (
+                logging.getLogger(name).handlers[:],
+                logging.getLogger(name).level,
+                logging.getLogger(name).propagate,
+            )
+            for name in logger_names
+        }
+        original_backend = main.backend_logger
+        original_browser = main.browser_logger
+        original_http = main.http_logger
+        original_raise_exceptions = logging.raiseExceptions
+        logging.raiseExceptions = False
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.dict(
+                os.environ,
+                {
+                    "LLM_COUNCIL_RUN_DIR": directory,
+                    "LLM_COUNCIL_RUN_ID": "test-run",
+                },
+                clear=False,
+            ), patch(
+                "backend.logging_config._CleanupRotatingFileHandler._open",
+                side_effect=OSError("write denied"),
+            ), patch("backend.main.log_event"):
+                main._configure_logging()
+                self.assertFalse(
+                    any(
+                        isinstance(handler, logging.FileHandler)
+                        for handler in main.backend_logger.handlers
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        isinstance(handler, logging.StreamHandler)
+                        for handler in main.backend_logger.handlers
+                    )
+                )
+        finally:
+            logging.raiseExceptions = original_raise_exceptions
+            for name, (handlers, level, propagate) in logger_state.items():
+                logger = logging.getLogger(name)
+                for handler in logger.handlers[:]:
+                    if handler not in handlers:
+                        logger.removeHandler(handler)
+                        handler.close()
+                logger.handlers = handlers
+                logger.setLevel(level)
+                logger.propagate = propagate
+            main.backend_logger = original_backend
+            main.browser_logger = original_browser
+            main.http_logger = original_http
