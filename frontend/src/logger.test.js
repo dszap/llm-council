@@ -181,7 +181,69 @@ test('sanitizes cyclic and oversized details and filters levels', async () => {
   assert.doesNotMatch(serialized, /secret-value/);
   assert.doesNotMatch(serialized, /filtered\.event/);
   assert.match(serialized, /truncated|error\.event/);
-  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0].events[0])).byteLength <= 256);
+  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0])).byteLength <= 256);
+});
+
+test('keeps every transmitted batch within the backend byte limit', async () => {
+  const sent = [];
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'DEBUG',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 256,
+    windowObject: createFakeWindow(),
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log('ERROR', 'first.event', 'x'.repeat(80));
+  logger.log('ERROR', 'second.event', 'y'.repeat(80));
+  logger.log('ERROR', 'third.event', 'z'.repeat(80));
+  await logger.flush();
+
+  assert.ok(sent.length >= 2);
+  for (const body of sent) {
+    assert.ok(new TextEncoder().encode(JSON.stringify(body)).byteLength <= 256);
+  }
+  assert.equal(sent.flatMap((body) => body.events).length, 3);
+});
+
+test('keeps every pagehide beacon within the backend byte limit', () => {
+  const beacons = [];
+  const windowObject = createFakeWindow();
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'DEBUG',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 256,
+    windowObject,
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async () => {},
+    beacon: (endpoint, body) => beacons.push(body),
+    setTimeoutFn: () => 1,
+    clearTimeoutFn: () => {},
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.start();
+  logger.log('ERROR', 'first.event', 'x'.repeat(80));
+  logger.log('ERROR', 'second.event', 'y'.repeat(80));
+  logger.log('ERROR', 'third.event', 'z'.repeat(80));
+  windowObject.dispatch('pagehide', {});
+  logger.stop();
+
+  assert.ok(beacons.length >= 1);
+  for (const body of beacons) {
+    assert.ok(new TextEncoder().encode(body).byteLength <= 256);
+  }
+  assert.equal(beacons.flatMap((body) => JSON.parse(body).events).length, 3);
 });
 
 test('keeps a nonempty message when truncating an oversized event', async () => {
@@ -202,7 +264,7 @@ test('keeps a nonempty message when truncating an oversized event', async () => 
   logger.log('ERROR', 'oversized.event', 'x'.repeat(5000));
   await logger.flush();
   assert.ok(sent[0].events[0].message.length > 0);
-  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0].events[0])).byteLength <= 256);
+  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0])).byteLength <= 256);
 });
 
 test('canonicalizes browser sensitive keys with spaces and hyphens', async () => {
@@ -377,7 +439,7 @@ test('caps long-page events and drops events below the metadata floor', async ()
   });
   logger.log('ERROR', 'page.event', 'failure');
   await logger.flush();
-  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0].events[0])).byteLength <= 256);
+  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0])).byteLength <= 256);
   assert.match(sent[0].events[0].page, /^https:\/\/council\.example\//);
 
   const tinySent = [];

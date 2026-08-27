@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from backend import main
 from backend.logging_config import JsonLineFormatter, log_event
-from backend.main import app
+from backend.main import BrowserLogBatch, app
 
 
 class HttpLoggingTests(unittest.TestCase):
@@ -166,6 +166,33 @@ class HttpLoggingTests(unittest.TestCase):
         )
         self.assertEqual(forbidden.status_code, 403)
         self.assertEqual(oversized.status_code, 413)
+
+    def test_browser_batch_byte_limit_matches_complete_serialized_body(self):
+        event = {
+            "client_timestamp": "2026-08-26T22:07:12.438Z",
+            "level": "ERROR",
+            "event": "browser.error",
+            "message": "bounded",
+            "browser_session_id": "session-1",
+            "page": "http://localhost:5173/",
+        }
+        exact_size = len(
+            BrowserLogBatch.model_validate({"events": [event]}).model_dump_json().encode("utf-8")
+        )
+        with patch.dict(os.environ, {"LOG_EVENT_MAX_BYTES": str(exact_size)}):
+            accepted = self.client.post(
+                "/api/logs/browser",
+                headers={"Origin": "http://localhost:5173"},
+                json={"events": [event]},
+            )
+        with patch.dict(os.environ, {"LOG_EVENT_MAX_BYTES": str(exact_size - 1)}):
+            rejected = self.client.post(
+                "/api/logs/browser",
+                headers={"Origin": "http://localhost:5173"},
+                json={"events": [event]},
+            )
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(rejected.status_code, 413)
 
     def test_conversation_route_binds_request_and_conversation_ids(self):
         stream = io.StringIO()

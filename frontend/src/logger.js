@@ -33,6 +33,29 @@ function serializedEventBytes(event) {
   return new TextEncoder().encode(JSON.stringify(event)).byteLength;
 }
 
+function serializedBatchBytes(events) {
+  return new TextEncoder().encode(JSON.stringify({ events })).byteLength;
+}
+
+function wrappedEventBytes(event) {
+  return serializedEventBytes({ events: [event] });
+}
+
+function takeTransportBatch(queue, batchSize, eventMaxBytes) {
+  const events = [];
+  while (events.length < batchSize && queue.length > 0) {
+    const candidate = [...events, queue[0]];
+    if (serializedBatchBytes(candidate) <= eventMaxBytes) {
+      events.push(queue.shift());
+    } else if (events.length === 0) {
+      queue.shift();
+    } else {
+      break;
+    }
+  }
+  return events;
+}
+
 function compactEventField(event, field, eventMaxBytes) {
   const original = event[field];
   const originalBytes = new TextEncoder().encode(original).byteLength;
@@ -43,7 +66,7 @@ function compactEventField(event, field, eventMaxBytes) {
 
   const fallback = field === 'page' ? '/' : '[truncated]';
   event[field] = '';
-  if (serializedEventBytes(event) > eventMaxBytes) return false;
+  if (wrappedEventBytes(event) > eventMaxBytes) return false;
 
   while (low <= high) {
     const middle = Math.floor((low + high) / 2);
@@ -51,7 +74,7 @@ function compactEventField(event, field, eventMaxBytes) {
       ? original
       : `${original.slice(0, middle)}${suffix}`;
     event[field] = candidate;
-    if (serializedEventBytes(event) <= eventMaxBytes) {
+    if (wrappedEventBytes(event) <= eventMaxBytes) {
       compacted = candidate;
       low = middle + 1;
     } else {
@@ -59,12 +82,12 @@ function compactEventField(event, field, eventMaxBytes) {
     }
   }
   event[field] = compacted || fallback;
-  return serializedEventBytes(event) <= eventMaxBytes;
+  return wrappedEventBytes(event) <= eventMaxBytes;
 }
 
 function truncateBrowserEvent(event, eventMaxBytes) {
   if (!Number.isInteger(eventMaxBytes) || eventMaxBytes <= 0) return null;
-  if (serializedEventBytes(event) <= eventMaxBytes) return event;
+  if (wrappedEventBytes(event) <= eventMaxBytes) return event;
 
   const truncatedEvent = {
     ...event,
@@ -72,9 +95,9 @@ function truncateBrowserEvent(event, eventMaxBytes) {
     details: { truncated: true },
   };
   if (!compactEventField(truncatedEvent, 'page', eventMaxBytes)) return null;
-  if (serializedEventBytes(truncatedEvent) <= eventMaxBytes) return truncatedEvent;
+  if (wrappedEventBytes(truncatedEvent) <= eventMaxBytes) return truncatedEvent;
   if (!compactEventField(truncatedEvent, 'message', eventMaxBytes)) return null;
-  return serializedEventBytes(truncatedEvent) <= eventMaxBytes ? truncatedEvent : null;
+  return wrappedEventBytes(truncatedEvent) <= eventMaxBytes ? truncatedEvent : null;
 }
 
 export function sanitizeBrowserValue(value, { eventMaxBytes, seen }) {
@@ -187,7 +210,11 @@ export function createBrowserLogger(options) {
     if (state.queue.length === 0) return undefined;
 
     state.flushing = true;
-    const events = state.queue.splice(0, batchSize);
+    const events = takeTransportBatch(state.queue, batchSize, eventMaxBytes);
+    if (events.length === 0) {
+      state.flushing = false;
+      return undefined;
+    }
     state.flushPromise = (async () => {
       try {
         await transport(endpoint, { events });
@@ -222,11 +249,14 @@ export function createBrowserLogger(options) {
 
   function onPageHide() {
     if (state.queue.length === 0 || !beacon) return;
-    const events = state.queue.splice(0, batchSize);
-    try {
-      beacon(endpoint, JSON.stringify({ events }));
-    } catch {
-      // Final unload diagnostics are best effort only.
+    while (state.queue.length > 0) {
+      const events = takeTransportBatch(state.queue, batchSize, eventMaxBytes);
+      if (events.length === 0) continue;
+      try {
+        beacon(endpoint, JSON.stringify({ events }));
+      } catch {
+        // Final unload diagnostics are best effort only.
+      }
     }
   }
 
