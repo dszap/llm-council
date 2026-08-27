@@ -4,11 +4,12 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -192,7 +193,7 @@ async def ingest_browser_logs(batch: BrowserLogBatch, request: Request):
             event.message,
             client_timestamp=event.client_timestamp,
             browser_session_id=event.browser_session_id,
-            page=event.page,
+            page=_sanitize_browser_page(event.page),
             details=event.details or {},
         )
     return {"accepted": len(batch.events)}
@@ -415,6 +416,13 @@ def _close_logger_handlers(*names: str) -> None:
                 closed_handlers.add(handler_id)
 
 
+def _sanitize_browser_page(value: str) -> str:
+    """Remove browser URL userinfo, query parameters, and fragments."""
+    parts = urlsplit(str(value))
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 class _UvicornAccessRecordFilter(logging.Filter):
     """Convert propagated Uvicorn access records into safe structured fields."""
 
@@ -454,6 +462,19 @@ def _configure_uvicorn_routing(uvicorn_logger: logging.Logger, level: str) -> No
         logger.setLevel(level)
         logger.propagate = True
     uvicorn_logger.propagate = False
+
+
+def _configure_domain_routing(backend_handlers: list[logging.Handler], level: str) -> None:
+    """Send council/OpenRouter records to backend handlers exactly once."""
+    parent = logging.getLogger("llm_council")
+    parent.handlers = backend_handlers[:]
+    parent.setLevel(level)
+    parent.propagate = False
+    for name in ("llm_council.council", "llm_council.openrouter"):
+        logger = logging.getLogger(name)
+        logger.handlers = []
+        logger.setLevel(level)
+        logger.propagate = True
 
 
 def _configure_logging() -> None:
@@ -502,12 +523,14 @@ def _configure_logging() -> None:
         http_logger.handlers = backend_logger.handlers[:]
         http_logger.setLevel(settings.backend_level)
         http_logger.propagate = False
+        _configure_domain_routing(backend_logger.handlers, settings.backend_level)
         _configure_uvicorn_routing(uvicorn_logger, settings.uvicorn_level)
     except OSError:
         _close_logger_handlers(
             "llm_council.backend",
             "llm_council.browser",
             "llm_council.http",
+            "llm_council",
             "uvicorn",
             "uvicorn.error",
             "uvicorn.access",
@@ -522,7 +545,13 @@ def _configure_logging() -> None:
         http_logger.handlers = backend_logger.handlers[:]
         http_logger.setLevel(settings.backend_level)
         http_logger.propagate = False
+        _configure_domain_routing(backend_logger.handlers, settings.backend_level)
         _configure_uvicorn_routing(uvicorn_logger, settings.uvicorn_level)
+        print(
+            "WARNING: file logging unavailable; using console-only logging.",
+            file=sys.stderr,
+            flush=True,
+        )
     log_event(
         backend_logger,
         logging.INFO,

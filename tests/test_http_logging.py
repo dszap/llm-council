@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import logging
@@ -121,7 +122,7 @@ class HttpLoggingTests(unittest.TestCase):
                             "event": "browser.unhandled_error",
                             "message": "boom",
                             "browser_session_id": "session-1",
-                            "page": "http://localhost:5173/",
+                            "page": "https://user:password@example.test/app?token=url-secret#fragment-secret",
                             "details": {
                                 "source": "attacker-controlled",
                                 "nested": {"authorization": "Bearer secret-value"},
@@ -139,6 +140,7 @@ class HttpLoggingTests(unittest.TestCase):
         self.assertEqual(payload["source"], "browser")
         self.assertEqual(payload["level"], "ERROR")
         self.assertEqual(payload["event"], "browser.unhandled_error")
+        self.assertEqual(payload["page"], "https://example.test/app")
         self.assertEqual(payload["details"]["source"], "attacker-controlled")
         self.assertEqual(payload["details"]["nested"]["authorization"], "[REDACTED]")
         self.assertNotIn("secret-value", stream.getvalue())
@@ -384,7 +386,9 @@ class HttpLoggingTests(unittest.TestCase):
                 "backend.logging_config._CleanupRotatingFileHandler._open",
                 return_value=WriteFailureStream(),
             ), patch("backend.main.log_event"):
-                main._configure_logging()
+                terminal = io.StringIO()
+                with contextlib.redirect_stderr(terminal):
+                    main._configure_logging()
                 self.assertFalse(
                     any(
                         isinstance(handler, logging.FileHandler)
@@ -397,6 +401,8 @@ class HttpLoggingTests(unittest.TestCase):
                         for handler in main.backend_logger.handlers
                     )
                 )
+                self.assertIn("WARNING", terminal.getvalue())
+                self.assertIn("console-only", terminal.getvalue())
         finally:
             logging.raiseExceptions = original_raise_exceptions
             for name, (handlers, level, propagate) in logger_state.items():

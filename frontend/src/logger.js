@@ -1,6 +1,6 @@
 import { API_BASE } from './api.js';
 
-const SENSITIVE_KEY = /authorization|proxy_authorization|cookie|set_cookie|password|secret|token|api_key/i;
+const SENSITIVE_KEY = /authorization|proxyauthorization|cookie|setcookie|password|secret|token|apikey/i;
 const TOKEN_VALUE = /(?:bearer\s+|sk-(?:or-)?[a-z0-9-]*)([a-z0-9_-]{12,})/gi;
 const SEVERITY = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
 
@@ -31,6 +31,7 @@ function compactEventField(event, field, eventMaxBytes) {
   let high = original.length;
   let compacted = '';
 
+  const fallback = field === 'page' ? '/' : '[truncated]';
   event[field] = '';
   if (serializedEventBytes(event) > eventMaxBytes) return false;
 
@@ -47,8 +48,8 @@ function compactEventField(event, field, eventMaxBytes) {
       high = middle - 1;
     }
   }
-  event[field] = compacted;
-  return true;
+  event[field] = compacted || fallback;
+  return serializedEventBytes(event) <= eventMaxBytes;
 }
 
 function truncateBrowserEvent(event, eventMaxBytes) {
@@ -57,7 +58,7 @@ function truncateBrowserEvent(event, eventMaxBytes) {
 
   const truncatedEvent = {
     ...event,
-    message: '',
+    message: '[truncated]',
     details: { truncated: true },
   };
   if (!compactEventField(truncatedEvent, 'page', eventMaxBytes)) return null;
@@ -89,7 +90,7 @@ export function sanitizeBrowserValue(value, { eventMaxBytes, seen }) {
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [
       key,
-      SENSITIVE_KEY.test(key)
+      SENSITIVE_KEY.test(String(key).toLowerCase().replace(/[^a-z0-9]/g, ''))
         ? '[REDACTED]'
         : sanitizeBrowserValue(item, { eventMaxBytes, seen }),
     ]),
@@ -151,7 +152,7 @@ export function createBrowserLogger(options) {
       client_timestamp: now(),
       level: eventLevel,
       event,
-      message: safe.message,
+      message: safe.message || '[empty]',
       browser_session_id: sessionId,
       page: sanitizeBrowserPage(windowObject.location.href),
       details: safe.details,

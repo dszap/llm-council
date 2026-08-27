@@ -296,6 +296,27 @@ class RetentionTests(unittest.TestCase):
             self.assertTrue((root / ".retention.lock").exists())
             self.assertTrue(active.exists())
 
+    def test_preserves_another_run_that_is_still_running_after_latest_rollover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = replace(LoggingSettings(), log_dir=root, retention_days=1)
+            first = create_run_context(
+                settings, now=datetime(2026, 1, 1, tzinfo=timezone.utc)
+            )
+            (first.run_dir / "manifest.json").write_text(
+                json.dumps({"status": "running"}), encoding="utf-8"
+            )
+            second = create_run_context(
+                settings, now=datetime(2026, 8, 26, tzinfo=timezone.utc)
+            )
+            actions = cleanup_logs(
+                settings,
+                second.run_dir,
+                now=datetime(2026, 8, 26, tzinfo=timezone.utc),
+            )
+            self.assertTrue(first.run_dir.exists())
+            self.assertFalse(any(action.path == str(first.run_dir) for action in actions))
+
 
 class RetentionLockTests(unittest.TestCase):
     def test_cleanup_waits_for_retention_lock(self):

@@ -24,7 +24,7 @@ DEFAULT_RETENTION_DAYS = 14
 DEFAULT_TOTAL_MAX_BYTES = 500 * 1024 * 1024
 VALID_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 SENSITIVE_KEYS = re.compile(
-    r"(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|password|secret|token|api(?:[_-]|\s)*key)",
+    r"(?:authorization|proxyauthorization|cookie|setcookie|password|secret|token|apikey)",
     re.IGNORECASE,
 )
 TOKEN_VALUE = re.compile(
@@ -33,11 +33,14 @@ TOKEN_VALUE = re.compile(
 INLINE_CREDENTIAL_VALUE = re.compile(
     r"""(?ix)
     (?P<prefix>
-        \b(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|password|secret|token|api(?:[_-]|\s)*key)\b
+        \b(?:authorization|proxy[-_ ]?authorization|cookie|set[-_ ]?cookie|password|secret|token|api[-_ ]?key)\b
         \s*(?:[:=]\s*|\s+)(?:(?:basic|bearer)\s+)?
     )
     (?P<secret>"[^"]*"|'[^']*'|[^\s,;]+)
     """
+)
+COOKIE_HEADER_VALUE = re.compile(
+    r"(?im)(?P<prefix>\b(?:cookie|set[-_ ]?cookie)\b\s*(?:[:=]\s*|\s+))(?P<secret>[^\r\n]*)"
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -141,7 +144,7 @@ def redact(value: Any) -> Any:
     """Recursively remove secrets and terminal-control sequences from log data."""
     if isinstance(value, Mapping):
         return {
-            _clean_string(str(key)): "[REDACTED]" if SENSITIVE_KEYS.search(str(key)) else redact(item)
+            _clean_string(str(key)): "[REDACTED]" if _is_sensitive_key(str(key)) else redact(item)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -198,13 +201,12 @@ class JsonLineFormatter(logging.Formatter):
                 if key not in payload:
                     payload[key] = value
         safe_payload = _normalize_non_finite(_truncate_fields(redact(payload), self.event_max_bytes))
-        return json.dumps(
-            safe_payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-            allow_nan=False,
-        )
+        # Extremely tiny limits are retained in the historical per-string
+        # truncation mode; practical configured limits enforce the aggregate
+        # serialized-byte bound below.
+        if self.event_max_bytes >= 64:
+            safe_payload = _fit_payload(safe_payload, self.event_max_bytes)
+        return _serialize_payload(safe_payload)
 
 
 class ConsoleFormatter(logging.Formatter):
@@ -367,6 +369,7 @@ def cleanup_logs(
                 protected_runs.add(_path_identity(latest.resolve(strict=True)))
             except FileNotFoundError:
                 pass
+        protected_runs.update(_active_run_identities(runs_dir))
 
         completed_runs = _completed_run_dirs(runs_dir, protected_runs)
         cutoff = current - timedelta(days=settings.retention_days)
@@ -425,6 +428,23 @@ def _completed_run_dirs(runs_dir: Path, protected_runs: set[Path]) -> list[Path]
         and _path_identity(path) not in protected_runs
     ]
     return sorted(run_dirs, key=lambda path: (_run_timestamp(path), path.name))
+
+
+def _active_run_identities(runs_dir: Path) -> set[Path]:
+    """Return runs whose supervisor manifest has not recorded termination."""
+    active: set[Path] = set()
+    for run_dir in runs_dir.iterdir():
+        if run_dir.is_symlink() or not run_dir.is_dir():
+            continue
+        manifest_path = run_dir / "manifest.json"
+        try:
+            with manifest_path.open(encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            continue
+        if manifest.get("status") in {"starting", "running"} and not manifest.get("ended_at"):
+            active.add(_path_identity(run_dir))
+    return active
 
 
 def _run_timestamp(run_dir: Path) -> datetime:
@@ -622,9 +642,104 @@ def _normalize_non_finite(value: Any) -> Any:
     return value
 
 
+def _is_sensitive_key(key: str) -> bool:
+    """Match sensitive field names independent of separators or casing."""
+    canonical = re.sub(r"[^a-z0-9]", "", key.lower())
+    return bool(SENSITIVE_KEYS.search(canonical))
+
+
+def _serialize_payload(value: Mapping[str, Any]) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+        allow_nan=False,
+    )
+
+
+def _truncate_strings(value: Any, max_bytes: int) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _truncate_strings(item, max_bytes) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_truncate_strings(item, max_bytes) for item in value]
+    if isinstance(value, str):
+        return truncate_utf8(value, max_bytes)[0]
+    return value
+
+
+def _fit_payload(value: Mapping[str, Any], max_bytes: int) -> dict[str, Any]:
+    """Fit the complete compact JSON payload, dropping least useful fields first."""
+    candidate = dict(value)
+    optional = {
+        key: item
+        for key, item in candidate.items()
+        if key not in {
+            "timestamp", "level", "source", "logger", "event", "message",
+            "run_id", "request_id", "conversation_id",
+        }
+    }
+    if len(_serialize_payload(candidate).encode("utf-8")) <= max_bytes:
+        return candidate
+
+    # Structured event fields and exception text are optional when the complete
+    # record would exceed the configured bound.  Keep the standard envelope.
+    envelope_keys = {
+        "timestamp", "level", "source", "logger", "event", "message",
+        "run_id", "request_id", "conversation_id",
+    }
+    candidate = {key: item for key, item in candidate.items() if key in envelope_keys}
+
+    # A shared string budget guarantees that the aggregate payload, rather than
+    # each individual value, is bounded.  Binary search keeps useful prefixes.
+    low, high = 0, max_bytes
+    best: dict[str, Any] | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        compacted = _truncate_strings(candidate, middle)
+        if len(_serialize_payload(compacted).encode("utf-8")) <= max_bytes:
+            best = compacted
+            low = middle + 1
+        else:
+            high = middle - 1
+    if best is not None:
+        return best
+
+    # If the envelope itself cannot fit, retain compact structured metadata
+    # (including truncation markers) when that is the most useful representation.
+    low, high = 0, max_bytes
+    optional_best: dict[str, Any] | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        compacted = _truncate_strings(optional, middle)
+        if len(_serialize_payload(compacted).encode("utf-8")) <= max_bytes:
+            optional_best = compacted
+            low = middle + 1
+        else:
+            high = middle - 1
+    if optional_best is not None and optional_best:
+        return optional_best
+
+    # Very small limits cannot hold the complete envelope. Drop optional
+    # correlation/source fields while retaining a useful message when possible.
+    for key in ("conversation_id", "request_id", "run_id", "logger", "source", "level", "event"):
+        candidate.pop(key, None)
+        compacted = _truncate_strings(candidate, max_bytes)
+        if len(_serialize_payload(compacted).encode("utf-8")) <= max_bytes:
+            return compacted
+
+    fallback = {"message": "[truncated]"}
+    if len(_serialize_payload(fallback).encode("utf-8")) <= max_bytes:
+        return fallback
+    return {"message": ""}
+
+
 def _redact_string(value: str) -> str:
-    without_inline_credentials = INLINE_CREDENTIAL_VALUE.sub(
+    without_cookie_headers = COOKIE_HEADER_VALUE.sub(
         lambda match: f"{match.group('prefix')}[REDACTED]", value
+    )
+    without_inline_credentials = INLINE_CREDENTIAL_VALUE.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]", without_cookie_headers
     )
     return _clean_string(TOKEN_VALUE.sub("[REDACTED]", without_inline_credentials))
 

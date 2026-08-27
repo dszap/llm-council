@@ -1,8 +1,12 @@
+import json
 import logging
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from backend import council, openrouter
+from backend import council, main, openrouter
 
 
 class OpenRouterLoggingTests(unittest.IsolatedAsyncioTestCase):
@@ -100,6 +104,65 @@ class OpenRouterLoggingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CouncilLoggingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_domain_events_use_backend_jsonl_only(self):
+        logger_names = (
+            "llm_council",
+            "llm_council.backend",
+            "llm_council.browser",
+            "llm_council.http",
+            "llm_council.council",
+            "llm_council.openrouter",
+            "uvicorn",
+            "uvicorn.error",
+            "uvicorn.access",
+        )
+        states = {
+            name: (
+                logging.getLogger(name).handlers[:],
+                logging.getLogger(name).level,
+                logging.getLogger(name).propagate,
+            )
+            for name in logger_names
+        }
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.dict(
+                os.environ,
+                {"LLM_COUNCIL_RUN_DIR": directory, "LLM_COUNCIL_RUN_ID": "runtime-run"},
+                clear=False,
+            ), patch(
+                "backend.council.query_models_parallel",
+                new=AsyncMock(return_value={"model/a": {"content": "answer"}}),
+            ):
+                main._configure_logging()
+                await council.stage1_collect_responses("question")
+                backend_events = [
+                    json.loads(line)
+                    for line in Path(directory, "backend.jsonl").read_text().splitlines()
+                ]
+                browser_events = [
+                    json.loads(line)
+                    for line in Path(directory, "browser.jsonl").read_text().splitlines()
+                ]
+            domain_events = [
+                event for event in backend_events if event["logger"] == "llm_council.council"
+            ]
+            self.assertTrue(domain_events)
+            self.assertTrue(all(event["source"] == "backend" for event in domain_events))
+            self.assertFalse(
+                any(event["logger"] in {"llm_council.council", "llm_council.openrouter"}
+                    for event in browser_events)
+            )
+        finally:
+            for name, (handlers, level, propagate) in states.items():
+                logger = logging.getLogger(name)
+                for handler in logger.handlers[:]:
+                    if handler not in handlers:
+                        logger.removeHandler(handler)
+                        handler.close()
+                logger.handlers = handlers
+                logger.setLevel(level)
+                logger.propagate = propagate
+
     async def test_stage_one_logs_start_completion_count_and_duration(self):
         records = []
         handler = logging.Handler()

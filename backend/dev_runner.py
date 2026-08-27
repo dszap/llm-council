@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+from dotenv import load_dotenv
+
 from .logging_config import (
     LoggingSettings,
     RunContext,
@@ -98,15 +100,20 @@ def stream_vite_output(
 
 
 def stop_children(
-    children: Sequence[subprocess.Popen], grace_seconds: float
+    children: Sequence[subprocess.Popen],
+    grace_seconds: float,
+    shutdown_signal: int | signal.Signals = signal.SIGTERM,
 ) -> dict[int, int]:
-    """Terminate children together, then kill only those exceeding the grace period."""
+    """Signal children together, then kill only those exceeding the grace period."""
     results: dict[int, int] = {}
     running: list[subprocess.Popen] = []
     for child in children:
         code = child.poll()
         if code is None:
-            child.terminate()
+            if shutdown_signal == signal.SIGTERM:
+                child.terminate()
+            else:
+                child.send_signal(shutdown_signal)
             running.append(child)
         else:
             results[child.pid] = code
@@ -146,6 +153,7 @@ def run(
     settings: LoggingSettings | None = None, poll_interval: float = 0.1
 ) -> int:
     """Supervise local backend and frontend processes for one durable log run."""
+    load_dotenv(dotenv_path=REPO_ROOT / ".env", override=False)
     effective = settings or LoggingSettings.from_env()
     context = create_run_context(effective)
     startup_cleanup = cleanup_logs(effective, context.run_dir)
@@ -251,7 +259,11 @@ def run(
         ]
         exit_codes = {
             **known_exit_codes,
-            **stop_children(children_to_stop, grace_seconds=5.0),
+            **stop_children(
+                children_to_stop,
+                grace_seconds=5.0,
+                shutdown_signal=supervisor_state["signal"] or signal.SIGTERM,
+            ),
         }
         if vite_thread is not None:
             vite_thread.join(timeout=5.0)

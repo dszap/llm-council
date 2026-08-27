@@ -1,11 +1,14 @@
 import io
 import json
+import os
+import signal
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from backend import dev_runner
 from backend.dev_runner import (
     atomic_write_manifest,
     build_child_commands,
@@ -44,6 +47,31 @@ class ViteStreamingTests(unittest.TestCase):
 
 
 class SupervisorTests(unittest.TestCase):
+    @patch("backend.dev_runner.subprocess.Popen")
+    def test_loads_logging_settings_from_repository_env_before_start(self, popen):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_dir = root / "configured-logs"
+            (root / ".env").write_text(
+                f"LOG_DIR={log_dir}\nLOG_BACKEND_LEVEL=DEBUG\n", encoding="utf-8"
+            )
+            backend = Mock(pid=101)
+            frontend = Mock(pid=102)
+            backend.poll.side_effect = [None, 1]
+            frontend.poll.return_value = None
+            frontend.stdout = iter([])
+            popen.side_effect = [backend, frontend]
+            with patch.object(dev_runner, "REPO_ROOT", root), patch.dict(
+                "os.environ", {}, clear=False
+            ):
+                os.environ.pop("LOG_DIR", None)
+                os.environ.pop("LOG_BACKEND_LEVEL", None)
+                result = run(settings=None, poll_interval=0)
+            self.assertNotEqual(result, 0)
+            self.assertTrue((log_dir / "latest").exists())
+            manifest = json.loads(next(log_dir.glob("runs/*/manifest.json")).read_text())
+            self.assertEqual(manifest["settings"]["backend_level"], "DEBUG")
+
     @patch("backend.dev_runner.subprocess.Popen")
     def test_child_failure_stops_sibling_and_returns_nonzero(self, popen):
         with tempfile.TemporaryDirectory() as directory:
@@ -118,6 +146,17 @@ class ChildConfigurationTests(unittest.TestCase):
 
 
 class ShutdownTests(unittest.TestCase):
+    def test_sigint_shutdown_is_forwarded_as_sigint(self):
+        child = Mock(pid=100)
+        child.poll.return_value = None
+        child.wait.return_value = -signal.SIGINT
+        result = stop_children(
+            [child], grace_seconds=0.1, shutdown_signal=signal.SIGINT
+        )
+        child.send_signal.assert_called_once_with(signal.SIGINT)
+        child.terminate.assert_not_called()
+        self.assertEqual(result[100], -signal.SIGINT)
+
     def test_graceful_stop_does_not_kill_child_that_exits(self):
         child = Mock(pid=101)
         child.poll.side_effect = [None, 0, 0]

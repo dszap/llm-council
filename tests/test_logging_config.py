@@ -62,6 +62,19 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(result["nested"]["safe"], "visible")
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz", result["text"])
 
+    def test_redacts_separator_variants_and_complete_cookie_headers(self):
+        value = {
+            "Proxy Authorization": "Bearer proxy-secret",
+            "api-key": "api-secret",
+            "Cookie": "session=one; csrf=two",
+            "Set-Cookie": "sid=three; theme=four",
+        }
+        result = redact(value)
+        self.assertEqual(result["Proxy Authorization"], "[REDACTED]")
+        self.assertEqual(result["api-key"], "[REDACTED]")
+        self.assertEqual(redact("Cookie: session=one; csrf=two"), "Cookie: [REDACTED]")
+        self.assertEqual(redact("Set-Cookie: sid=three; theme=four"), "Set-Cookie: [REDACTED]")
+
     def test_utf8_truncation_reports_original_size(self):
         value, truncated, original_bytes = truncate_utf8("á" * 10, 8)
         self.assertTrue(truncated)
@@ -193,6 +206,26 @@ class RedactionTests(unittest.TestCase):
         payload = json.loads(stream.getvalue())
         self.assertTrue(payload["answer_truncated"])
         self.assertEqual(payload["answer_original_bytes"], 65)
+
+    def test_json_formatter_caps_complete_serialized_payload(self):
+        for max_bytes in (128, 256, 512):
+            stream = io.StringIO()
+            handler = logging.StreamHandler(stream)
+            handler.setFormatter(JsonLineFormatter(event_max_bytes=max_bytes))
+            logger = logging.getLogger(f"test.logging.aggregate_limit.{max_bytes}")
+            logger.handlers = [handler]
+            logger.propagate = False
+            logger.setLevel(logging.INFO)
+            log_event(
+                logger,
+                logging.INFO,
+                "oversized.event",
+                "m" * 500,
+                **{f"field_{index}": "x" * 500 for index in range(20)},
+            )
+            serialized = stream.getvalue().rstrip("\n")
+            self.assertLessEqual(len(serialized.encode("utf-8")), max_bytes)
+            json.loads(serialized)
 
     def _has_truncation_metadata(self, value, field):
         return any(entry[0] == field and entry[1] == 1 for entry in value["_"])

@@ -184,6 +184,51 @@ test('sanitizes cyclic and oversized details and filters levels', async () => {
   assert.ok(new TextEncoder().encode(JSON.stringify(sent[0].events[0])).byteLength <= 256);
 });
 
+test('keeps a nonempty message when truncating an oversized event', async () => {
+  const sent = [];
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 256,
+    windowObject: createFakeWindow(),
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+  logger.log('ERROR', 'oversized.event', 'x'.repeat(5000));
+  await logger.flush();
+  assert.ok(sent[0].events[0].message.length > 0);
+  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0].events[0])).byteLength <= 256);
+});
+
+test('canonicalizes browser sensitive keys with spaces and hyphens', async () => {
+  const sent = [];
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject: createFakeWindow(),
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+  logger.log('ERROR', 'sensitive.event', 'failure', {
+    'Proxy Authorization': 'Bearer secret-value',
+    'api-key': 'api-secret-value',
+  });
+  await logger.flush();
+  assert.equal(sent[0].events[0].details['Proxy Authorization'], '[REDACTED]');
+  assert.equal(sent[0].events[0].details['api-key'], '[REDACTED]');
+});
+
 test('stop restores console and transport rejection is contained', async () => {
   const originalErrors = [];
   const originalError = (...args) => originalErrors.push(args);
