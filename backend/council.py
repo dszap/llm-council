@@ -1,8 +1,14 @@
 """3-stage LLM Council orchestration."""
 
+import logging
+import time
 from typing import List, Dict, Any, Tuple
 from .openrouter import query_models_parallel, query_model
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from .logging_config import log_event
+
+
+logger = logging.getLogger("llm_council.council")
 
 
 async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
@@ -15,6 +21,16 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     Returns:
         List of dicts with 'model' and 'response' keys
     """
+    started_at = time.perf_counter()
+    log_event(
+        logger,
+        logging.INFO,
+        "council.stage.started",
+        "Council stage started",
+        stage="stage1",
+        input_count=1,
+        model_count=len(COUNCIL_MODELS),
+    )
     messages = [{"role": "user", "content": user_query}]
 
     # Query all models in parallel
@@ -29,6 +45,16 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
                 "response": response.get('content', '')
             })
 
+    log_event(
+        logger,
+        logging.INFO,
+        "council.stage.completed",
+        "Council stage completed",
+        stage="stage1",
+        input_count=1,
+        response_count=len(stage1_results),
+        duration_ms=int((time.perf_counter() - started_at) * 1000),
+    )
     return stage1_results
 
 
@@ -46,6 +72,16 @@ async def stage2_collect_rankings(
     Returns:
         Tuple of (rankings list, label_to_model mapping)
     """
+    started_at = time.perf_counter()
+    log_event(
+        logger,
+        logging.INFO,
+        "council.stage.started",
+        "Council stage started",
+        stage="stage2",
+        input_count=len(stage1_results),
+        model_count=len(COUNCIL_MODELS),
+    )
     # Create anonymized labels for responses (Response A, Response B, etc.)
     labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
 
@@ -109,6 +145,16 @@ Now provide your evaluation and ranking:"""
                 "parsed_ranking": parsed
             })
 
+    log_event(
+        logger,
+        logging.INFO,
+        "council.stage.completed",
+        "Council stage completed",
+        stage="stage2",
+        input_count=len(stage1_results),
+        response_count=len(stage2_results),
+        duration_ms=int((time.perf_counter() - started_at) * 1000),
+    )
     return stage2_results, label_to_model
 
 
@@ -128,6 +174,16 @@ async def stage3_synthesize_final(
     Returns:
         Dict with 'model' and 'response' keys
     """
+    started_at = time.perf_counter()
+    log_event(
+        logger,
+        logging.INFO,
+        "council.stage.started",
+        "Council stage started",
+        stage="stage3",
+        stage1_count=len(stage1_results),
+        stage2_count=len(stage2_results),
+    )
     # Build comprehensive context for chairman
     stage1_text = "\n\n".join([
         f"Model: {result['model']}\nResponse: {result['response']}"
@@ -163,15 +219,36 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
     if response is None:
         # Fallback if chairman fails
-        return {
+        result = {
             "model": CHAIRMAN_MODEL,
             "response": "Error: Unable to generate final synthesis."
         }
+        log_event(
+            logger,
+            logging.WARNING,
+            "council.chairman_fallback",
+            "Chairman response unavailable; using fallback",
+            stage1_count=len(stage1_results),
+            stage2_count=len(stage2_results),
+        )
+    else:
+        result = {
+            "model": CHAIRMAN_MODEL,
+            "response": response.get('content', '')
+        }
 
-    return {
-        "model": CHAIRMAN_MODEL,
-        "response": response.get('content', '')
-    }
+    log_event(
+        logger,
+        logging.INFO,
+        "council.stage.completed",
+        "Council stage completed",
+        stage="stage3",
+        stage1_count=len(stage1_results),
+        stage2_count=len(stage2_results),
+        response_count=1,
+        duration_ms=int((time.perf_counter() - started_at) * 1000),
+    )
+    return result
 
 
 def parse_ranking_from_text(ranking_text: str) -> List[str]:
@@ -308,6 +385,15 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
 
     # If no models responded successfully, return error
     if not stage1_results:
+        log_event(
+            logger,
+            logging.ERROR,
+            "council.all_models_failed",
+            "All council models failed to respond",
+            stage="stage1",
+            response_count=0,
+            model_count=len(COUNCIL_MODELS),
+        )
         return [], [], {
             "model": "error",
             "response": "All models failed to respond. Please try again."
