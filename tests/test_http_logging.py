@@ -52,6 +52,35 @@ class HttpLoggingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.headers["x-request-id"], request_id)
 
+    def test_unhandled_cors_failure_returns_request_id_and_allow_origin(self):
+        request_id = "28e8f443-7eb8-41e4-8ca6-79689b13d36d"
+        logger = logging.getLogger("llm_council.http")
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
+        logger.handlers = [logging.NullHandler()]
+        logger.propagate = False
+        try:
+            with patch(
+                "backend.main.storage.list_conversations", side_effect=RuntimeError("boom")
+            ):
+                response = TestClient(app, raise_server_exceptions=False).get(
+                    "/api/conversations",
+                    headers={
+                        "X-Request-ID": request_id,
+                        "Origin": "http://localhost:5173",
+                    },
+                )
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.headers["x-request-id"], request_id)
+        self.assertEqual(
+            response.headers["access-control-allow-origin"], "http://localhost:5173"
+        )
+
     def test_browser_batch_is_logged_with_server_owned_source(self):
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
