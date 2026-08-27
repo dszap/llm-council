@@ -81,6 +81,23 @@ class HttpLoggingTests(unittest.TestCase):
             response.headers["access-control-allow-origin"], "http://localhost:5173"
         )
 
+    def test_allowed_cors_preflight_returns_request_id(self):
+        response = self.client.options(
+            "/api/logs/browser",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertRegex(
+            response.headers["x-request-id"],
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        )
+        self.assertEqual(
+            response.headers["access-control-allow-origin"], "http://localhost:5173"
+        )
+
     def test_browser_batch_is_logged_with_server_owned_source(self):
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)

@@ -47,6 +47,18 @@ backend_logger = logging.getLogger("llm_council.backend")
 browser_logger = logging.getLogger("llm_council.browser")
 http_logger = logging.getLogger("llm_council.http")
 
+
+# Enable CORS for local development. Register before correlation so correlation
+# also observes CORS preflight requests.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 def valid_request_id(value: str | None) -> str:
     """Return a valid incoming request ID or generate a new UUID."""
     if value:
@@ -94,20 +106,14 @@ async def correlate_request(request: Request, call_next):
             content={"detail": "Internal server error"},
         )
         response.headers["X-Request-ID"] = request_id
+        origin = request.headers.get("Origin")
+        if origin in ALLOWED_FRONTEND_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Vary"] = "Origin"
         return response
     finally:
         reset_log_context(tokens)
-
-
-# Enable CORS for local development. Register after correlation so CORS wraps
-# every response, including safe error responses produced by that middleware.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_FRONTEND_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 class CreateConversationRequest(BaseModel):
