@@ -79,6 +79,84 @@ npm run dev
 
 Then open http://localhost:5173 in your browser.
 
+## Logging
+
+Start the local supervisor with:
+
+```bash
+./start.sh
+```
+
+Every run gets its own UTC directory under `logs/runs/`; `logs/latest` is an
+atomic symlink to the active or most recent run. Each run contains a manifest
+and one JSON Lines source per component:
+
+```text
+logs/
+  latest -> runs/<run-id>/
+  runs/
+    <run-id>/
+      backend.jsonl
+      uvicorn.jsonl
+      vite.jsonl
+      browser.jsonl
+      manifest.json
+```
+
+Use `logs/latest` when following a current run or when an agent needs a stable
+path. For example:
+
+```bash
+tail -f logs/latest/backend.jsonl
+tail -f logs/latest/uvicorn.jsonl
+tail -f logs/latest/vite.jsonl
+tail -f logs/latest/browser.jsonl
+```
+
+Logs rotate at 10 MiB per source by default. Completed runs are retained for
+14 days, and the `logs/runs/` tree is capped at 500 MiB. Logging records
+metadata by default (such as model, stage, status, and duration), not prompts
+or responses. Setting `LOG_LLM_PAYLOADS=true` explicitly opts into recording
+user and model content, so use it only for short-lived local debugging.
+Secrets, authorization headers, cookies, and token-shaped values are redacted
+in all modes.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `LOG_LEVEL` | `INFO` | General logging level. |
+| `LOG_BACKEND_LEVEL` | `INFO` | Backend application and HTTP-event level. |
+| `LOG_UVICORN_LEVEL` | `INFO` | Uvicorn server and access-event level. |
+| `LOG_VITE_LEVEL` | `INFO` | Vite terminal-output event level. |
+| `LOG_BROWSER_LEVEL` | `WARNING` | Browser diagnostic level; `DEBUG` also forwards ordinary console output. |
+| `LOG_DIR` | `logs` | Root directory for run logs and the `latest` symlink. |
+| `LOG_MAX_BYTES` | `10485760` (10 MiB) | Maximum size of one active source file before rotation. |
+| `LOG_RETENTION_DAYS` | `14` | Number of days to retain completed runs. |
+| `LOG_TOTAL_MAX_BYTES` | `524288000` (500 MiB) | Total size cap for the run-log tree. |
+| `LOG_LLM_PAYLOADS` | `false` | Records LLM payloads only when set to literal `true`. |
+| `LOG_BROWSER_BATCH_SIZE` | `20` | Maximum accepted browser events per batch. |
+| `LOG_BROWSER_FLUSH_MS` | `2000` | Browser forwarding interval in milliseconds. |
+| `LOG_BROWSER_QUEUE_LIMIT` | `200` | Maximum queued browser events before oldest events are dropped. |
+| `LOG_EVENT_MAX_BYTES` | `65536` | Per-event size bound used for structured logging and browser ingestion. |
+
+Logging levels accept `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
+Invalid logging values print a safe warning and use the documented default.
+The supervisor passes the corresponding `VITE_LOG_*` browser settings to Vite;
+these are derived from the `LOG_*` values above rather than a separate user
+configuration surface.
+
+If an already-created run directory cannot open its log files, the backend
+falls back to terminal-only logging. If `LOG_DIR` itself cannot be created,
+the supervisor exits with an error; choose a writable `LOG_DIR` and restart.
+
+The real-process smoke test is opt-in and uses a temporary `LOG_DIR`:
+
+```bash
+RUN_LOGGING_SMOKE=1 uv run python -m unittest tests.test_logging_smoke -v
+```
+
+It only probes the local health endpoints and posts one browser warning; it
+does not send a council request or consume OpenRouter credits.
+
 ## Tech Stack
 
 - **Backend:** FastAPI (Python 3.10+), async httpx, OpenRouter API
