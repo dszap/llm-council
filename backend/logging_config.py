@@ -440,6 +440,8 @@ def _active_run_identities(runs_dir: Path) -> set[Path]:
                 manifest = json.load(handle)
         except (OSError, ValueError, TypeError):
             continue
+        if not isinstance(manifest, Mapping):
+            continue
         if manifest.get("status") in {"starting", "running"} and not manifest.get("ended_at"):
             active.add(_path_identity(run_dir))
     return active

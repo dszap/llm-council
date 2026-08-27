@@ -296,6 +296,29 @@ class RetentionTests(unittest.TestCase):
             self.assertTrue((root / ".retention.lock").exists())
             self.assertTrue(active.exists())
 
+    def test_cleanup_tolerates_non_object_active_manifests(self):
+        for manifest_value in ([], ["running"], "running", 42, True, None):
+            with self.subTest(manifest_value=manifest_value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                settings = replace(LoggingSettings(), log_dir=root, retention_days=1)
+                malformed = root / "runs" / "2026-01-01T000000Z"
+                malformed.mkdir(parents=True)
+                (malformed / "manifest.json").write_text(
+                    json.dumps(manifest_value), encoding="utf-8"
+                )
+                current = create_run_context(
+                    settings, now=datetime(2026, 8, 26, tzinfo=timezone.utc)
+                ).run_dir
+
+                actions = cleanup_logs(
+                    settings,
+                    current,
+                    now=datetime(2026, 8, 26, tzinfo=timezone.utc),
+                )
+
+                self.assertFalse(malformed.exists())
+                self.assertTrue(any(action.reason == "expired" for action in actions))
+
     def test_preserves_another_run_that_is_still_running_after_latest_rollover(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
