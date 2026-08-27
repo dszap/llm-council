@@ -293,6 +293,51 @@ class HttpLoggingTests(unittest.TestCase):
         self.assertEqual(payload["request_id"], request_id)
         self.assertEqual(payload["conversation_id"], response.json()["id"])
 
+    def test_propagated_uvicorn_access_record_includes_request_path(self):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(JsonLineFormatter(source="uvicorn", run_id="test-run"))
+        uvicorn_logger = logging.getLogger("uvicorn")
+        access_logger = logging.getLogger("uvicorn.access")
+        uvicorn_state = (
+            uvicorn_logger.handlers[:],
+            uvicorn_logger.level,
+            uvicorn_logger.propagate,
+        )
+        access_state = (
+            access_logger.handlers[:],
+            access_logger.level,
+            access_logger.propagate,
+        )
+        uvicorn_logger.handlers = [handler]
+        uvicorn_logger.setLevel(logging.INFO)
+        uvicorn_logger.propagate = False
+        access_logger.handlers = []
+        access_logger.setLevel(logging.INFO)
+        access_logger.propagate = True
+        try:
+            main._configure_uvicorn_routing(uvicorn_logger, "INFO")
+            access_logger.info(
+                '%s - "%s %s HTTP/%s" %d',
+                "127.0.0.1:50000",
+                "GET",
+                "/",
+                "1.1",
+                200,
+            )
+        finally:
+            uvicorn_logger.handlers = uvicorn_state[0]
+            uvicorn_logger.setLevel(uvicorn_state[1])
+            uvicorn_logger.propagate = uvicorn_state[2]
+            access_logger.handlers = access_state[0]
+            access_logger.setLevel(access_state[1])
+            access_logger.propagate = access_state[2]
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(payload["source"], "uvicorn")
+        self.assertEqual(payload["path"], "/")
+        self.assertEqual(payload["method"], "GET")
+        self.assertEqual(payload["status_code"], 200)
+
     def test_logging_setup_falls_back_when_delayed_file_write_fails(self):
         class WriteFailureStream:
             def write(self, value):

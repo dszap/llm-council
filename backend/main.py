@@ -8,6 +8,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Literal
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -414,6 +415,47 @@ def _close_logger_handlers(*names: str) -> None:
                 closed_handlers.add(handler_id)
 
 
+class _UvicornAccessRecordFilter(logging.Filter):
+    """Convert propagated Uvicorn access records into safe structured fields."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "uvicorn.access" or not isinstance(record.args, tuple):
+            return True
+        if len(record.args) < 5:
+            return True
+
+        _, method, target, http_version, status_code = record.args[:5]
+        path = urlsplit(str(target)).path or "/"
+        fields = getattr(record, "event_fields", {})
+        record.event_name = "http.access"
+        record.event_fields = {
+            **(fields if isinstance(fields, dict) else {}),
+            "method": str(method),
+            "path": path,
+            "http_version": str(http_version),
+            "status_code": int(status_code),
+        }
+        record.msg = "HTTP access"
+        record.args = ()
+        return True
+
+
+def _configure_uvicorn_routing(uvicorn_logger: logging.Logger, level: str) -> None:
+    """Route Uvicorn child loggers to dedicated, access-aware handlers."""
+    for handler in uvicorn_logger.handlers:
+        handler.filters[:] = [
+            filter_ for filter_ in handler.filters
+            if not isinstance(filter_, _UvicornAccessRecordFilter)
+        ]
+        handler.addFilter(_UvicornAccessRecordFilter())
+    for name in ("uvicorn.error", "uvicorn.access"):
+        logger = logging.getLogger(name)
+        logger.handlers = []
+        logger.setLevel(level)
+        logger.propagate = True
+    uvicorn_logger.propagate = False
+
+
 def _configure_logging() -> None:
     """Configure separate backend, browser, and Uvicorn JSONL log sources."""
     global backend_logger, browser_logger
@@ -460,12 +502,7 @@ def _configure_logging() -> None:
         http_logger.handlers = backend_logger.handlers[:]
         http_logger.setLevel(settings.backend_level)
         http_logger.propagate = False
-        for name in ("uvicorn.error", "uvicorn.access"):
-            logger = logging.getLogger(name)
-            logger.handlers = []
-            logger.setLevel(settings.uvicorn_level)
-            logger.propagate = True
-        uvicorn_logger.propagate = False
+        _configure_uvicorn_routing(uvicorn_logger, settings.uvicorn_level)
     except OSError:
         _close_logger_handlers(
             "llm_council.backend",
@@ -485,12 +522,7 @@ def _configure_logging() -> None:
         http_logger.handlers = backend_logger.handlers[:]
         http_logger.setLevel(settings.backend_level)
         http_logger.propagate = False
-        for name in ("uvicorn.error", "uvicorn.access"):
-            logger = logging.getLogger(name)
-            logger.handlers = []
-            logger.setLevel(settings.uvicorn_level)
-            logger.propagate = True
-        uvicorn_logger.propagate = False
+        _configure_uvicorn_routing(uvicorn_logger, settings.uvicorn_level)
     log_event(
         backend_logger,
         logging.INFO,
