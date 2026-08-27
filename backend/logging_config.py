@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shutil
+import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -226,13 +227,21 @@ class ConsoleFormatter(logging.Formatter):
 class _CleanupRotatingFileHandler(RotatingFileHandler):
     """Run retention after rollover completes and the handler lock is released."""
 
-    def __init__(self, *args: Any, rollover_callback: Callable[[], None], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        retention_log_dir: Path,
+        rollover_callback: Callable[[], None],
+        **kwargs: Any,
+    ) -> None:
+        self._retention_log_dir = retention_log_dir
         self._rollover_callback = rollover_callback
         self._did_rollover = False
         super().__init__(*args, **kwargs)
 
     def doRollover(self) -> None:
-        super().doRollover()
+        with retention_lock(self._retention_log_dir):
+            super().doRollover()
         self._did_rollover = True
 
     def handle(self, record: logging.LogRecord) -> bool:
@@ -271,18 +280,27 @@ def create_run_context(settings: LoggingSettings, now: datetime | None = None) -
     current = now or datetime.now(timezone.utc)
     run_id = current.astimezone(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     runs_dir = settings.log_dir / "runs"
-    run_dir = runs_dir / run_id
-    suffix = 1
-    while run_dir.exists():
-        run_dir = runs_dir / f"{run_id}-{suffix}"
-        suffix += 1
-    run_dir.mkdir(parents=True)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    suffix = 0
+    while True:
+        directory_name = run_id if suffix == 0 else f"{run_id}-{suffix}"
+        run_dir = runs_dir / directory_name
+        try:
+            run_dir.mkdir()
+            break
+        except FileExistsError:
+            suffix += 1
     latest = settings.log_dir / "latest"
-    temporary = settings.log_dir / ".latest.tmp"
-    temporary.unlink(missing_ok=True)
-    temporary.symlink_to(run_dir.relative_to(settings.log_dir), target_is_directory=True)
-    os.replace(temporary, latest)
-    return RunContext(run_dir.name, run_dir, latest)
+    temporary = settings.log_dir / f".latest.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.symlink_to(
+            run_dir.relative_to(settings.log_dir),
+            target_is_directory=True,
+        )
+        os.replace(temporary, latest)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return RunContext(run_id, run_dir, latest)
 
 
 def configure_source_logger(
@@ -308,6 +326,7 @@ def configure_source_logger(
         backupCount=100,
         encoding="utf-8",
         delay=True,
+        retention_log_dir=settings.log_dir,
         rollover_callback=lambda: cleanup_logs(settings, path.parent),
     )
     file_handler.setLevel(level)
@@ -340,11 +359,12 @@ def cleanup_logs(
         if not runs_dir.is_dir():
             return actions
 
-        protected_runs = {_absolute_path(current_run_dir)}
+        active_run_dir = _path_identity(current_run_dir)
+        protected_runs = {active_run_dir}
         latest = settings.log_dir / "latest"
         if latest.is_symlink():
             try:
-                protected_runs.add(_absolute_path(latest.resolve(strict=True)))
+                protected_runs.add(_path_identity(latest.resolve(strict=True)))
             except FileNotFoundError:
                 pass
 
@@ -364,7 +384,7 @@ def cleanup_logs(
             actions.append(action)
             total_bytes -= action.bytes_removed
 
-        active_segments = _active_rotated_segments(current_run_dir)
+        active_segments = _active_rotated_segments(active_run_dir)
         for segment in active_segments:
             if total_bytes <= settings.total_max_bytes:
                 break
@@ -381,11 +401,19 @@ def cleanup_logs(
                 )
             )
             total_bytes -= bytes_removed
+        if total_bytes > settings.total_max_bytes:
+            actions.append(
+                CleanupAction(
+                    path=str(_path_identity(runs_dir)),
+                    reason="size_cap_hard_floor",
+                    bytes_removed=0,
+                )
+            )
     return actions
 
 
-def _absolute_path(path: Path) -> Path:
-    return Path(os.path.abspath(path))
+def _path_identity(path: Path) -> Path:
+    return path.resolve(strict=False)
 
 
 def _completed_run_dirs(runs_dir: Path, protected_runs: set[Path]) -> list[Path]:
@@ -394,7 +422,7 @@ def _completed_run_dirs(runs_dir: Path, protected_runs: set[Path]) -> list[Path]
         for path in runs_dir.iterdir()
         if not path.is_symlink()
         and path.is_dir()
-        and _absolute_path(path) not in protected_runs
+        and _path_identity(path) not in protected_runs
     ]
     return sorted(run_dirs, key=lambda path: (_run_timestamp(path), path.name))
 
