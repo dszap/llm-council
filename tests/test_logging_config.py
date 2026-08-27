@@ -83,10 +83,17 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("secret-value", records[0].getMessage())
 
     def test_redacts_inline_credentials_from_messages_exceptions_and_formatters(self):
-        secret_values = ("pass-value", "cookie-value", "basic-value", "key-value", "secret-value")
+        secret_values = (
+            "pass-value",
+            "cookie-value",
+            "basic-value",
+            "key-value",
+            "secret-value",
+            "top-secret",
+        )
         text = (
             "password=pass-value Cookie: cookie-value Authorization: Basic basic-value "
-            "api_key=key-value secret: secret-value"
+            "api_key=key-value secret: secret-value api key: top-secret"
         )
         self.assertTrue(all(value not in redact(text) for value in secret_values))
 
@@ -155,6 +162,9 @@ class RedactionTests(unittest.TestCase):
                         "event_fields": {
                             "outer": {"nested": "nested-is-longer-than-eight-bytes"},
                             "items": ["item-is-longer-than-eight-bytes"],
+                            "unbounded-field-name": {
+                                "unbounded-nested-name": "nested-value-is-longer-than-eight-bytes"
+                            },
                         },
                     },
                 )
@@ -162,12 +172,30 @@ class RedactionTests(unittest.TestCase):
             reset_log_context(tokens)
 
         payload = json.loads(stream.getvalue())
-        self.assertTrue(payload["message_truncated"])
-        self.assertTrue(payload["exception_truncated"])
-        self.assertTrue(payload["outer"]["nested_truncated"])
-        self.assertTrue(payload["items_truncated"])
+        self.assertTrue(self._has_truncation_metadata(payload, "message"))
+        self.assertTrue(self._has_truncation_metadata(payload, "exceptio"))
+        self.assertTrue(self._has_truncation_metadata(payload["outer"], "nested"))
+        self.assertTrue(self._has_truncation_metadata(payload, "items"))
         self.assertLessEqual(len(payload["items"][0].encode("utf-8")), 8)
         self._assert_string_values_within(payload, 8)
+        self._assert_mapping_keys_within(payload, 8)
+
+    def test_json_formatter_preserves_named_metadata_when_it_fits(self):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(JsonLineFormatter(event_max_bytes=64))
+        logger = logging.getLogger("test.logging.named_metadata")
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+        log_event(logger, logging.INFO, "test.completed", "Done", answer="a" * 65)
+
+        payload = json.loads(stream.getvalue())
+        self.assertTrue(payload["answer_truncated"])
+        self.assertEqual(payload["answer_original_bytes"], 65)
+
+    def _has_truncation_metadata(self, value, field):
+        return any(entry[0] == field and entry[1] == 1 for entry in value["_"])
 
     def _assert_string_values_within(self, value, max_bytes):
         if isinstance(value, dict):
@@ -178,6 +206,15 @@ class RedactionTests(unittest.TestCase):
                 self._assert_string_values_within(item, max_bytes)
         elif isinstance(value, str):
             self.assertLessEqual(len(value.encode("utf-8")), max_bytes)
+
+    def _assert_mapping_keys_within(self, value, max_bytes):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                self.assertLessEqual(len(key.encode("utf-8")), max_bytes)
+                self._assert_mapping_keys_within(item, max_bytes)
+        elif isinstance(value, list):
+            for item in value:
+                self._assert_mapping_keys_within(item, max_bytes)
 
 
 class JsonFormatterTests(unittest.TestCase):

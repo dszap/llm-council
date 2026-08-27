@@ -19,7 +19,7 @@ DEFAULT_RETENTION_DAYS = 14
 DEFAULT_TOTAL_MAX_BYTES = 500 * 1024 * 1024
 VALID_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 SENSITIVE_KEYS = re.compile(
-    r"(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|password|secret|token|api[_-]?key)",
+    r"(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|password|secret|token|api(?:[_-]|\s)*key)",
     re.IGNORECASE,
 )
 TOKEN_VALUE = re.compile(
@@ -28,7 +28,7 @@ TOKEN_VALUE = re.compile(
 INLINE_CREDENTIAL_VALUE = re.compile(
     r"""(?ix)
     (?P<prefix>
-        \b(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|password|secret|token|api[_-]?key)\b
+        \b(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|password|secret|token|api(?:[_-]|\s)*key)\b
         \s*(?:[:=]\s*|\s+)(?:(?:basic|bearer)\s+)?
     )
     (?P<secret>"[^"]*"|'[^']*'|[^\s,;]+)
@@ -279,13 +279,28 @@ def _warn_invalid(name: str, warning_sink: Callable[[str], None]) -> None:
 def _truncate_fields(value: Any, max_bytes: int) -> Any:
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
+        metadata: list[list[Any]] = []
         for key, item in value.items():
-            safe_key = str(key)
+            safe_key, key_was_truncated, key_original_bytes = truncate_utf8(
+                _clean_string(str(key)), max_bytes
+            )
             shortened, was_truncated, original_bytes = _truncate_value(item, max_bytes)
             result[safe_key] = shortened
+            if key_was_truncated:
+                metadata.append([safe_key, 0, key_original_bytes])
             if was_truncated:
-                result[f"{safe_key}_truncated"] = True
-                result[f"{safe_key}_original_bytes"] = original_bytes
+                truncated_key = f"{safe_key}_truncated"
+                original_bytes_key = f"{safe_key}_original_bytes"
+                if (
+                    len(truncated_key.encode("utf-8")) <= max_bytes
+                    and len(original_bytes_key.encode("utf-8")) <= max_bytes
+                ):
+                    result[truncated_key] = True
+                    result[original_bytes_key] = original_bytes
+                else:
+                    metadata.append([safe_key, 1, original_bytes])
+        if metadata:
+            result["_"] = metadata
         return result
     if isinstance(value, list):
         return [_truncate_value(item, max_bytes)[0] for item in value]
