@@ -229,6 +229,46 @@ test('canonicalizes browser sensitive keys with spaces and hyphens', async () =>
   assert.equal(sent[0].events[0].details['api-key'], '[REDACTED]');
 });
 
+test('redacts complete header-style values before browser transport', async () => {
+  const sent = [];
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject: createFakeWindow(),
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log(
+    'ERROR',
+    'headers.exposed',
+    'Cookie: session=one; csrf=two',
+    {
+      response: 'Set-Cookie: sid=three; theme=four',
+      auth: 'Authorization: Basic basic-secret',
+      proxy: 'Proxy-Authorization: Bearer proxy-secret-value',
+      mixed: 'sEt - CoOkIe \t: mixed-secret',
+      safe: 'visible',
+    },
+  );
+  await logger.flush();
+
+  const serialized = JSON.stringify(sent);
+  assert.doesNotMatch(serialized, /session=one|csrf=two|sid=three|theme=four/);
+  assert.doesNotMatch(serialized, /basic-secret|proxy-secret-value|mixed-secret/);
+  assert.match(serialized, /Cookie: \[REDACTED\]/);
+  assert.match(serialized, /Set-Cookie: \[REDACTED\]/);
+  assert.match(serialized, /Authorization: \[REDACTED\]/);
+  assert.match(serialized, /Proxy-Authorization: \[REDACTED\]/);
+  assert.match(serialized, /"safe":"visible"/);
+});
+
 test('stop restores console and transport rejection is contained', async () => {
   const originalErrors = [];
   const originalError = (...args) => originalErrors.push(args);

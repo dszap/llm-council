@@ -2,7 +2,17 @@ import { API_BASE } from './api.js';
 
 const SENSITIVE_KEY = /authorization|proxyauthorization|cookie|setcookie|password|secret|token|apikey/i;
 const TOKEN_VALUE = /(?:bearer\s+|sk-(?:or-)?[a-z0-9-]*)([a-z0-9_-]{12,})/gi;
+const HEADER_VALUE = /(?<prefix>\b(?:proxy[\s-]*authorization|set[\s-]*cookie|authorization|cookie)\s*:\s*)[^\r\n]*/gi;
 const SEVERITY = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
+
+function redactBrowserString(value) {
+  return String(value)
+    .replace(HEADER_VALUE, (...args) => {
+      const groups = args[args.length - 1];
+      return `${groups.prefix}[REDACTED]`;
+    })
+    .replace(TOKEN_VALUE, (match) => `${match.slice(0, 8)}[REDACTED]`);
+}
 
 function truncateBrowserText(value, maxBytes) {
   const encoded = new TextEncoder().encode(value);
@@ -69,10 +79,7 @@ function truncateBrowserEvent(event, eventMaxBytes) {
 
 export function sanitizeBrowserValue(value, { eventMaxBytes, seen }) {
   if (typeof value === 'string') {
-    return truncateBrowserText(
-      value.replace(TOKEN_VALUE, (match) => `${match.slice(0, 8)}[REDACTED]`),
-      eventMaxBytes,
-    );
+    return truncateBrowserText(redactBrowserString(value), eventMaxBytes);
   }
   if (value === null || ['boolean', 'number'].includes(typeof value)) return value;
   if (value instanceof Error) {
