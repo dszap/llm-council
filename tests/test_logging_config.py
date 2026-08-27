@@ -46,6 +46,23 @@ class LoggingSettingsTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertNotIn("1", warnings[0])
 
+    def test_browser_transport_limits_share_frontend_maxima(self):
+        warnings = []
+        settings = LoggingSettings.from_env(
+            {
+                "LOG_BROWSER_BATCH_SIZE": "101",
+                "LOG_BROWSER_FLUSH_MS": "60001",
+                "LOG_BROWSER_QUEUE_LIMIT": "1001",
+                "LOG_EVENT_MAX_BYTES": "65537",
+            },
+            warning_sink=warnings.append,
+        )
+        self.assertEqual(settings.browser_batch_size, 20)
+        self.assertEqual(settings.browser_flush_ms, 2000)
+        self.assertEqual(settings.browser_queue_limit, 200)
+        self.assertEqual(settings.event_max_bytes, 65536)
+        self.assertEqual(len(warnings), 4)
+
     def test_payload_logging_only_accepts_literal_true(self):
         warnings = []
         for value in ("1", "yes", "on"):

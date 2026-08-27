@@ -38,6 +38,11 @@ APPROVED_VITE_SETTINGS = {
     "VITE_LOG_BROWSER_QUEUE_LIMIT": "browser_queue_limit",
     "VITE_LOG_EVENT_MAX_BYTES": "event_max_bytes",
 }
+FRONTEND_RUNTIME_ENVIRONMENT = frozenset(
+    {"PATH", "HOME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "ComSpec", "PATHEXT"}
+)
+BACKEND_SERVICE = {"host": "0.0.0.0", "port": 8001}
+FRONTEND_SERVICE = {"host": "localhost", "port": 5173}
 
 
 @dataclass(frozen=True)
@@ -71,14 +76,23 @@ def atomic_write_manifest(path: Path, payload: Mapping[str, Any]) -> None:
 def build_child_environment(
     settings: LoggingSettings, context: RunContext
 ) -> dict[str, str]:
-    """Copy the host environment while exposing only approved Vite settings."""
+    """Build the frontend's runtime-only environment and derived Vite settings."""
+    del context
     environment = {
-        key: value for key, value in os.environ.items() if not key.startswith("VITE_")
+        key: os.environ[key]
+        for key in FRONTEND_RUNTIME_ENVIRONMENT
+        if key in os.environ
     }
-    environment["LLM_COUNCIL_RUN_ID"] = context.run_id
-    environment["LLM_COUNCIL_RUN_DIR"] = str(context.run_dir.resolve())
     for environment_name, setting_name in APPROVED_VITE_SETTINGS.items():
         environment[environment_name] = str(getattr(settings, setting_name))
+    return environment
+
+
+def build_backend_environment(context: RunContext) -> dict[str, str]:
+    """Preserve backend configuration while providing the active run context."""
+    environment = dict(os.environ)
+    environment["LLM_COUNCIL_RUN_ID"] = context.run_id
+    environment["LLM_COUNCIL_RUN_DIR"] = str(context.run_dir.resolve())
     return environment
 
 
@@ -149,6 +163,57 @@ def _close_logger(logger: logging.Logger) -> None:
         handler.close()
 
 
+def _record_lifecycle_error(
+    manifest: dict[str, Any], phase: str, error: Exception
+) -> None:
+    manifest.setdefault("lifecycle_errors", []).append(
+        {"phase": phase, "error": type(error).__name__}
+    )
+
+
+def _warn_lifecycle_failure(phase: str, error: Exception) -> None:
+    del error
+    print(
+        f"WARNING: {phase} failed; details withheld to protect credentials.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _safe_cleanup(
+    settings: LoggingSettings,
+    context: RunContext,
+    manifest: dict[str, Any],
+    phase: str,
+) -> list[Any]:
+    try:
+        return cleanup_logs(settings, context.run_dir)
+    except Exception as error:
+        _record_lifecycle_error(manifest, f"{phase}_cleanup", error)
+        _warn_lifecycle_failure(f"{phase} retention cleanup", error)
+        return []
+
+
+def _safe_write_manifest(
+    path: Path, manifest: dict[str, Any], phase: str
+) -> bool:
+    try:
+        atomic_write_manifest(path, manifest)
+        return True
+    except Exception as error:
+        _record_lifecycle_error(manifest, f"{phase}_manifest", error)
+        _warn_lifecycle_failure(f"{phase} manifest update", error)
+        return False
+
+
+def _manifest_child(child: subprocess.Popen, spec: ChildCommand) -> dict[str, Any]:
+    return {
+        "pid": child.pid,
+        "command": list(spec.args),
+        "cwd": str(spec.cwd.resolve()),
+    }
+
+
 def run(
     settings: LoggingSettings | None = None, poll_interval: float = 0.1
 ) -> int:
@@ -156,9 +221,7 @@ def run(
     load_dotenv(dotenv_path=REPO_ROOT / ".env", override=False)
     effective = settings or LoggingSettings.from_env()
     context = create_run_context(effective)
-    startup_cleanup = cleanup_logs(effective, context.run_dir)
     manifest_path = context.run_dir / "manifest.json"
-    child_environment = build_child_environment(effective, context)
     backend_spec, frontend_spec = build_child_commands(REPO_ROOT)
     shutdown_requested = threading.Event()
     supervisor_state = {"signal": None, "unexpected_exit": False}
@@ -170,6 +233,8 @@ def run(
     backend: subprocess.Popen | None = None
     frontend: subprocess.Popen | None = None
     startup_error: OSError | None = None
+    exit_codes: dict[int, int] = {}
+    shutdown_cleanup: list[Any] = []
 
     def request_shutdown(signum: int, frame: Any) -> None:
         del frame
@@ -180,11 +245,17 @@ def run(
         "run_id": context.run_id,
         "started_at": utc_timestamp(),
         "status": "starting",
+        "repository_root": str(REPO_ROOT.resolve()),
         "settings": effective.to_safe_dict(),
-        "startup_cleanup": _cleanup_payload(startup_cleanup),
+        "services": {
+            "backend": BACKEND_SERVICE,
+            "frontend": FRONTEND_SERVICE,
+        },
         "children": {},
     }
-    atomic_write_manifest(manifest_path, manifest)
+    startup_cleanup = _safe_cleanup(effective, context, manifest, "startup")
+    manifest["startup_cleanup"] = _cleanup_payload(startup_cleanup)
+    _safe_write_manifest(manifest_path, manifest, "startup")
 
     if threading.current_thread() is threading.main_thread():
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -196,13 +267,13 @@ def run(
             backend = subprocess.Popen(
                 backend_spec.args,
                 cwd=backend_spec.cwd,
-                env=child_environment,
+                env=build_backend_environment(context),
             )
             children.append(backend)
             frontend = subprocess.Popen(
                 frontend_spec.args,
                 cwd=frontend_spec.cwd,
-                env=child_environment,
+                env=build_child_environment(effective, context),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -215,17 +286,11 @@ def run(
         if startup_error is None:
             assert backend is not None and frontend is not None
             manifest["children"] = {
-                "backend": {
-                    "pid": backend.pid,
-                    "command": list(backend_spec.args),
-                },
-                "frontend": {
-                    "pid": frontend.pid,
-                    "command": list(frontend_spec.args),
-                },
+                "backend": _manifest_child(backend, backend_spec),
+                "frontend": _manifest_child(frontend, frontend_spec),
             }
             manifest["status"] = "running"
-            atomic_write_manifest(manifest_path, manifest)
+            _safe_write_manifest(manifest_path, manifest, "running")
 
             vite_logger = configure_source_logger(
                 name="llm_council.vite",
@@ -254,24 +319,34 @@ def run(
                         known_exit_codes[frontend.pid] = frontend_code
                     break
     finally:
-        children_to_stop = [
-            child for child in children if child.pid not in known_exit_codes
-        ]
-        exit_codes = {
-            **known_exit_codes,
-            **stop_children(
-                children_to_stop,
-                grace_seconds=5.0,
-                shutdown_signal=supervisor_state["signal"] or signal.SIGTERM,
-            ),
-        }
-        if vite_thread is not None:
-            vite_thread.join(timeout=5.0)
-        shutdown_cleanup = cleanup_logs(effective, context.run_dir)
-        if vite_logger is not None:
-            _close_logger(vite_logger)
-        for signum, previous in previous_handlers.items():
-            signal.signal(signum, previous)
+        try:
+            children_to_stop = [
+                child for child in children if child.pid not in known_exit_codes
+            ]
+            exit_codes = {
+                **known_exit_codes,
+                **stop_children(
+                    children_to_stop,
+                    grace_seconds=5.0,
+                    shutdown_signal=supervisor_state["signal"] or signal.SIGTERM,
+                ),
+            }
+        finally:
+            try:
+                if vite_thread is not None:
+                    vite_thread.join(timeout=5.0)
+            finally:
+                try:
+                    shutdown_cleanup = _safe_cleanup(
+                        effective, context, manifest, "shutdown"
+                    )
+                finally:
+                    try:
+                        if vite_logger is not None:
+                            _close_logger(vite_logger)
+                    finally:
+                        for signum, previous in previous_handlers.items():
+                            signal.signal(signum, previous)
 
     if startup_error is not None:
         manifest["status"] = "unclean"
@@ -281,14 +356,9 @@ def run(
         )
         manifest["shutdown_cleanup"] = _cleanup_payload(shutdown_cleanup)
         if backend is not None:
-            manifest["children"] = {
-                "backend": {
-                    "pid": backend.pid,
-                    "command": list(backend_spec.args),
-                    "exit_code": exit_codes[backend.pid],
-                }
-            }
-        atomic_write_manifest(manifest_path, manifest)
+            manifest["children"] = {"backend": _manifest_child(backend, backend_spec)}
+            manifest["children"]["backend"]["exit_code"] = exit_codes[backend.pid]
+        _safe_write_manifest(manifest_path, manifest, "shutdown")
         return 1
 
     assert backend is not None and frontend is not None
@@ -312,7 +382,7 @@ def run(
     manifest["shutdown_cleanup"] = _cleanup_payload(shutdown_cleanup)
     manifest["children"]["backend"]["exit_code"] = exit_codes[backend.pid]
     manifest["children"]["frontend"]["exit_code"] = exit_codes[frontend.pid]
-    atomic_write_manifest(manifest_path, manifest)
+    _safe_write_manifest(manifest_path, manifest, "shutdown")
 
     if clean:
         return 0

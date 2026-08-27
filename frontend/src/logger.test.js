@@ -331,6 +331,34 @@ test('redacts complete header-style values before browser transport', async () =
   assert.match(serialized, /"safe":"visible"/);
 });
 
+test('redacts complete standalone bearer and API-key credentials before transport', async () => {
+  const sent = [];
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject: createFakeWindow(),
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log(
+    'ERROR',
+    'credential.exposed',
+    'Bearer bearer-secret-value-12345 sk-or-api-secret-value-12345',
+  );
+  await logger.flush();
+
+  const message = sent[0].events[0].message;
+  assert.equal(message, 'Bearer [REDACTED] sk-or-[REDACTED]');
+  assert.doesNotMatch(message, /bearer-secret|api-secret/);
+});
+
 test('stop restores console and transport rejection is contained', async () => {
   const originalErrors = [];
   const originalError = (...args) => originalErrors.push(args);

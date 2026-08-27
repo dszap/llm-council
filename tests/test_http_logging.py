@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from backend import main
 from backend.logging_config import JsonLineFormatter, log_event
-from backend.main import BrowserLogBatch, app
+from backend.main import app
 
 
 class HttpLoggingTests(unittest.TestCase):
@@ -145,6 +145,29 @@ class HttpLoggingTests(unittest.TestCase):
         self.assertEqual(payload["details"]["nested"]["authorization"], "[REDACTED]")
         self.assertNotIn("secret-value", stream.getvalue())
 
+    def test_browser_beacon_content_type_accepts_json_batch(self):
+        """A sendBeacon string uses text/plain but must retain browser diagnostics."""
+        event = {
+            "client_timestamp": "2026-08-26T22:07:12.438Z",
+            "level": "ERROR",
+            "event": "browser.pagehide",
+            "message": "unload diagnostic",
+            "browser_session_id": "session-1",
+            "page": "http://localhost:5173/",
+        }
+
+        response = self.client.post(
+            "/api/logs/browser",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Content-Type": "text/plain;charset=UTF-8",
+            },
+            content=json.dumps({"events": [event]}),
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json(), {"accepted": 1})
+
     def test_browser_ingestion_degrades_safely_for_malformed_pages(self):
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
@@ -211,9 +234,8 @@ class HttpLoggingTests(unittest.TestCase):
             "browser_session_id": "session-1",
             "page": "http://localhost:5173/",
         }
-        exact_size = len(
-            BrowserLogBatch.model_validate({"events": [event]}).model_dump_json().encode("utf-8")
-        )
+        body = json.dumps({"events": [event]}, separators=(",", ":")).encode("utf-8")
+        exact_size = len(body)
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
         logger = logging.getLogger("llm_council.browser")
@@ -227,14 +249,20 @@ class HttpLoggingTests(unittest.TestCase):
             with patch.dict(os.environ, {"LOG_EVENT_MAX_BYTES": str(exact_size)}):
                 accepted = self.client.post(
                     "/api/logs/browser",
-                    headers={"Origin": "http://localhost:5173"},
-                    json={"events": [event]},
+                    headers={
+                        "Origin": "http://localhost:5173",
+                        "Content-Type": "application/json",
+                    },
+                    content=body,
                 )
             with patch.dict(os.environ, {"LOG_EVENT_MAX_BYTES": str(exact_size - 1)}):
                 rejected = self.client.post(
                     "/api/logs/browser",
-                    headers={"Origin": "http://localhost:5173"},
-                    json={"events": [event]},
+                    headers={
+                        "Origin": "http://localhost:5173",
+                        "Content-Type": "application/json",
+                    },
+                    content=body,
                 )
         finally:
             logger.handlers = original_handlers
@@ -417,23 +445,12 @@ class HttpLoggingTests(unittest.TestCase):
         self.assertEqual(payload["method"], "GET")
         self.assertEqual(payload["status_code"], 200)
 
-    def test_logging_setup_falls_back_when_delayed_file_write_fails(self):
-        class WriteFailureStream:
-            def write(self, value):
-                if value:
-                    raise OSError("write denied")
-                return 0
-
-            def flush(self):
-                return None
-
-            def close(self):
-                return None
-
+    def test_logging_setup_keeps_healthy_sources_durable_when_browser_file_fails(self):
         logger_names = (
             "llm_council.backend",
             "llm_council.browser",
             "llm_council.http",
+            "llm_council",
             "uvicorn",
             "uvicorn.error",
             "uvicorn.access",
@@ -446,12 +463,18 @@ class HttpLoggingTests(unittest.TestCase):
             )
             for name in logger_names
         }
+        original_configure = main.configure_source_logger
         original_backend = main.backend_logger
         original_browser = main.browser_logger
         original_http = main.http_logger
         original_raise_exceptions = logging.raiseExceptions
         logging.raiseExceptions = False
         try:
+            def configure_with_browser_failure(name, source, *args, **kwargs):
+                if source == "browser":
+                    raise OSError("OPENROUTER_API_KEY=browser-file-secret")
+                return original_configure(name, source, *args, **kwargs)
+
             with tempfile.TemporaryDirectory() as directory, patch.dict(
                 os.environ,
                 {
@@ -460,26 +483,31 @@ class HttpLoggingTests(unittest.TestCase):
                 },
                 clear=False,
             ), patch(
-                "backend.logging_config._CleanupRotatingFileHandler._open",
-                return_value=WriteFailureStream(),
+                "backend.main.configure_source_logger",
+                side_effect=configure_with_browser_failure,
             ), patch("backend.main.log_event"):
                 terminal = io.StringIO()
                 with contextlib.redirect_stderr(terminal):
                     main._configure_logging()
-                self.assertFalse(
+                self.assertTrue(
                     any(
                         isinstance(handler, logging.FileHandler)
                         for handler in main.backend_logger.handlers
                     )
                 )
+                uvicorn_logger = logging.getLogger("uvicorn")
+                self.assertTrue(
+                    any(isinstance(handler, logging.FileHandler) for handler in uvicorn_logger.handlers)
+                )
                 self.assertTrue(
                     any(
                         isinstance(handler, logging.StreamHandler)
-                        for handler in main.backend_logger.handlers
+                        for handler in main.browser_logger.handlers
                     )
                 )
                 self.assertIn("WARNING", terminal.getvalue())
-                self.assertIn("console-only", terminal.getvalue())
+                self.assertIn("browser", terminal.getvalue())
+                self.assertNotIn("browser-file-secret", terminal.getvalue())
         finally:
             logging.raiseExceptions = original_raise_exceptions
             for name, (handlers, level, propagate) in logger_state.items():

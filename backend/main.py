@@ -14,7 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import storage
 from .council import (
@@ -173,16 +173,22 @@ async def root():
 
 
 @app.post("/api/logs/browser", status_code=202)
-async def ingest_browser_logs(batch: BrowserLogBatch, request: Request):
+async def ingest_browser_logs(request: Request):
     """Accept bounded browser events from configured local development origins."""
     origin = request.headers.get("origin")
     if origin not in ALLOWED_FRONTEND_ORIGINS:
         raise HTTPException(status_code=403, detail="Origin not allowed")
 
     settings = LoggingSettings.from_env()
-    if len(batch.events) > settings.browser_batch_size:
+    raw_body = await request.body()
+    if len(raw_body) > settings.event_max_bytes:
         raise HTTPException(status_code=413, detail="Browser log batch too large")
-    if len(batch.model_dump_json().encode("utf-8")) > settings.event_max_bytes:
+    try:
+        batch = BrowserLogBatch.model_validate(json.loads(raw_body))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError):
+        raise HTTPException(status_code=422, detail="Invalid browser log batch") from None
+
+    if len(batch.events) > settings.browser_batch_size:
         raise HTTPException(status_code=413, detail="Browser log batch too large")
 
     for event in batch.events:
@@ -403,6 +409,37 @@ def _validate_file_targets(*loggers: logging.Logger) -> None:
                 handler.release()
 
 
+def _configure_source_with_fallback(
+    name: str,
+    source: str,
+    path: Path,
+    level: str,
+    run_id: str,
+    settings: LoggingSettings,
+) -> logging.Logger:
+    """Keep each source durable when possible without coupling file failures."""
+    try:
+        logger = configure_source_logger(
+            name,
+            source,
+            path,
+            level,
+            run_id,
+            settings,
+            include_console=True,
+        )
+        _validate_file_targets(logger)
+        return logger
+    except OSError:
+        _close_logger_handlers(name)
+        print(
+            f"WARNING: {source} file logging unavailable; using console-only logging for {source}.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _configure_console_logger(name, level)
+
+
 def _close_logger_handlers(*names: str) -> None:
     """Remove and close partially configured handlers without double-closing."""
     closed_handlers: set[int] = set()
@@ -489,76 +526,44 @@ def _configure_logging() -> None:
     global backend_logger, browser_logger
 
     settings = LoggingSettings.from_env()
-    try:
-        run_dir_value = os.environ.get("LLM_COUNCIL_RUN_DIR")
-        run_id = os.environ.get("LLM_COUNCIL_RUN_ID")
-        if run_dir_value and run_id:
-            run_dir = Path(run_dir_value)
-        else:
-            context = create_run_context(settings)
-            run_dir = context.run_dir
-            run_id = context.run_id
+    run_dir_value = os.environ.get("LLM_COUNCIL_RUN_DIR")
+    run_id = os.environ.get("LLM_COUNCIL_RUN_ID")
+    if run_dir_value and run_id:
+        run_dir = Path(run_dir_value)
+    else:
+        context = create_run_context(settings)
+        run_dir = context.run_dir
+        run_id = context.run_id
 
-        backend_logger = configure_source_logger(
-            "llm_council.backend",
-            "backend",
-            run_dir / "backend.jsonl",
-            settings.backend_level,
-            run_id,
-            settings,
-            include_console=True,
-        )
-        browser_logger = configure_source_logger(
-            "llm_council.browser",
-            "browser",
-            run_dir / "browser.jsonl",
-            settings.browser_level,
-            run_id,
-            settings,
-            include_console=True,
-        )
-        uvicorn_logger = configure_source_logger(
-            "uvicorn",
-            "uvicorn",
-            run_dir / "uvicorn.jsonl",
-            settings.uvicorn_level,
-            run_id,
-            settings,
-            include_console=True,
-        )
-        _validate_file_targets(backend_logger, browser_logger, uvicorn_logger)
-        http_logger.handlers = backend_logger.handlers[:]
-        http_logger.setLevel(settings.backend_level)
-        http_logger.propagate = False
-        _configure_domain_routing(backend_logger.handlers, settings.backend_level)
-        _configure_uvicorn_routing(uvicorn_logger, settings.uvicorn_level)
-    except OSError:
-        _close_logger_handlers(
-            "llm_council.backend",
-            "llm_council.browser",
-            "llm_council.http",
-            "llm_council",
-            "uvicorn",
-            "uvicorn.error",
-            "uvicorn.access",
-        )
-        backend_logger = _configure_console_logger(
-            "llm_council.backend", settings.backend_level
-        )
-        browser_logger = _configure_console_logger(
-            "llm_council.browser", settings.browser_level
-        )
-        uvicorn_logger = _configure_console_logger("uvicorn", settings.uvicorn_level)
-        http_logger.handlers = backend_logger.handlers[:]
-        http_logger.setLevel(settings.backend_level)
-        http_logger.propagate = False
-        _configure_domain_routing(backend_logger.handlers, settings.backend_level)
-        _configure_uvicorn_routing(uvicorn_logger, settings.uvicorn_level)
-        print(
-            "WARNING: file logging unavailable; using console-only logging.",
-            file=sys.stderr,
-            flush=True,
-        )
+    backend_logger = _configure_source_with_fallback(
+        "llm_council.backend",
+        "backend",
+        run_dir / "backend.jsonl",
+        settings.backend_level,
+        run_id,
+        settings,
+    )
+    browser_logger = _configure_source_with_fallback(
+        "llm_council.browser",
+        "browser",
+        run_dir / "browser.jsonl",
+        settings.browser_level,
+        run_id,
+        settings,
+    )
+    uvicorn_logger = _configure_source_with_fallback(
+        "uvicorn",
+        "uvicorn",
+        run_dir / "uvicorn.jsonl",
+        settings.uvicorn_level,
+        run_id,
+        settings,
+    )
+    http_logger.handlers = backend_logger.handlers[:]
+    http_logger.setLevel(settings.backend_level)
+    http_logger.propagate = False
+    _configure_domain_routing(backend_logger.handlers, settings.backend_level)
+    _configure_uvicorn_routing(uvicorn_logger, settings.uvicorn_level)
     log_event(
         backend_logger,
         logging.INFO,

@@ -22,6 +22,11 @@ from typing import Any, Callable
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_TOTAL_MAX_BYTES = 500 * 1024 * 1024
+# These maxima are forwarded to the browser and match frontend/src/logger.js.
+BROWSER_BATCH_SIZE_MAX = 100
+BROWSER_FLUSH_MS_MAX = 60_000
+BROWSER_QUEUE_LIMIT_MAX = 1_000
+EVENT_MAX_BYTES_MAX = 65_536
 VALID_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 SENSITIVE_KEYS = re.compile(
     r"(?:authorization|proxyauthorization|cookie|setcookie|password|secret|token|apikey)",
@@ -70,7 +75,7 @@ class LoggingSettings:
     browser_batch_size: int = 20
     browser_flush_ms: int = 2000
     browser_queue_limit: int = 200
-    event_max_bytes: int = 65536
+    event_max_bytes: int = EVENT_MAX_BYTES_MAX
 
     @classmethod
     def from_env(
@@ -509,15 +514,34 @@ def _settings_from_mapping(values: Mapping[str, str], warning_sink: Callable[[st
         retention_days=_parse_positive_int(values, "LOG_RETENTION_DAYS", defaults.retention_days, warning_sink),
         total_max_bytes=_parse_positive_int(values, "LOG_TOTAL_MAX_BYTES", defaults.total_max_bytes, warning_sink),
         log_llm_payloads=_parse_payload_logging(values, "LOG_LLM_PAYLOADS", warning_sink),
-        browser_batch_size=_parse_positive_int(values, "LOG_BROWSER_BATCH_SIZE", defaults.browser_batch_size, warning_sink),
-        browser_flush_ms=_parse_positive_int(values, "LOG_BROWSER_FLUSH_MS", defaults.browser_flush_ms, warning_sink),
-        browser_queue_limit=_parse_positive_int(values, "LOG_BROWSER_QUEUE_LIMIT", defaults.browser_queue_limit, warning_sink),
+        browser_batch_size=_parse_positive_int(
+            values,
+            "LOG_BROWSER_BATCH_SIZE",
+            defaults.browser_batch_size,
+            warning_sink,
+            maximum=BROWSER_BATCH_SIZE_MAX,
+        ),
+        browser_flush_ms=_parse_positive_int(
+            values,
+            "LOG_BROWSER_FLUSH_MS",
+            defaults.browser_flush_ms,
+            warning_sink,
+            maximum=BROWSER_FLUSH_MS_MAX,
+        ),
+        browser_queue_limit=_parse_positive_int(
+            values,
+            "LOG_BROWSER_QUEUE_LIMIT",
+            defaults.browser_queue_limit,
+            warning_sink,
+            maximum=BROWSER_QUEUE_LIMIT_MAX,
+        ),
         event_max_bytes=_parse_positive_int(
             values,
             "LOG_EVENT_MAX_BYTES",
             defaults.event_max_bytes,
             warning_sink,
             minimum=2,
+            maximum=EVENT_MAX_BYTES_MAX,
         ),
     )
 
@@ -540,6 +564,7 @@ def _parse_positive_int(
     warning_sink: Callable[[str], None],
     *,
     minimum: int = 1,
+    maximum: int | None = None,
 ) -> int:
     value = values.get(name)
     if value is None:
@@ -549,7 +574,7 @@ def _parse_positive_int(
     except (TypeError, ValueError):
         _warn_invalid(name, warning_sink)
         return default
-    if parsed < minimum:
+    if parsed < minimum or (maximum is not None and parsed > maximum):
         _warn_invalid(name, warning_sink)
         return default
     return parsed

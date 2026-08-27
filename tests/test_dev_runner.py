@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -90,6 +91,103 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "unclean")
             self.assertEqual(manifest["children"]["backend"]["exit_code"], 1)
             self.assertIn("startup_cleanup", manifest)
+            self.assertEqual(manifest["repository_root"], str(dev_runner.REPO_ROOT.resolve()))
+            self.assertEqual(manifest["children"]["backend"]["cwd"], str(dev_runner.REPO_ROOT.resolve()))
+            self.assertEqual(manifest["children"]["frontend"]["cwd"], str((dev_runner.REPO_ROOT / "frontend").resolve()))
+            self.assertEqual(manifest["services"]["backend"], {"host": "0.0.0.0", "port": 8001})
+            self.assertEqual(manifest["services"]["frontend"], {"host": "localhost", "port": 5173})
+
+    @patch("backend.dev_runner.subprocess.Popen")
+    def test_startup_cleanup_failure_warns_redacted_but_starts_children(self, popen):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = LoggingSettings(log_dir=Path(directory))
+            backend = Mock(pid=101)
+            frontend = Mock(pid=102)
+            backend.poll.side_effect = [None, 1]
+            frontend.poll.return_value = None
+            frontend.wait.return_value = 0
+            frontend.stdout = iter([])
+            popen.side_effect = [backend, frontend]
+            terminal = io.StringIO()
+            with patch(
+                "backend.dev_runner.cleanup_logs",
+                side_effect=[OSError("OPENROUTER_API_KEY=cleanup-secret"), []],
+            ), contextlib.redirect_stderr(terminal):
+                try:
+                    result = run(settings=settings, poll_interval=0)
+                except Exception as error:  # Establish RED without letting the test error.
+                    result = error
+
+            self.assertEqual(result, 1)
+            self.assertEqual(popen.call_count, 2)
+            manifest_text = next(Path(directory).glob("runs/*/manifest.json")).read_text()
+            self.assertNotIn("cleanup-secret", terminal.getvalue())
+            self.assertNotIn("cleanup-secret", manifest_text)
+
+    @patch("backend.dev_runner.subprocess.Popen")
+    def test_manifest_write_failure_is_redacted_and_later_finalization_continues(self, popen):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = LoggingSettings(log_dir=Path(directory))
+            backend = Mock(pid=101)
+            frontend = Mock(pid=102)
+            backend.poll.side_effect = [None, 1]
+            frontend.poll.return_value = None
+            frontend.wait.return_value = 0
+            frontend.stdout = iter([])
+            popen.side_effect = [backend, frontend]
+            write_manifest = dev_runner.atomic_write_manifest
+            calls = 0
+
+            def fail_initial_manifest(path, payload):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError("OPENROUTER_API_KEY=manifest-secret")
+                write_manifest(path, payload)
+
+            terminal = io.StringIO()
+            with patch(
+                "backend.dev_runner.atomic_write_manifest",
+                side_effect=fail_initial_manifest,
+            ), contextlib.redirect_stderr(terminal):
+                try:
+                    result = run(settings=settings, poll_interval=0)
+                except Exception as error:  # Establish RED without letting the test error.
+                    result = error
+
+            self.assertEqual(result, 1)
+            self.assertEqual(popen.call_count, 2)
+            manifest_text = next(Path(directory).glob("runs/*/manifest.json")).read_text()
+            self.assertIn('\"status\": \"unclean\"', manifest_text)
+            self.assertNotIn("manifest-secret", terminal.getvalue())
+            self.assertNotIn("manifest-secret", manifest_text)
+
+    @patch("backend.dev_runner.subprocess.Popen")
+    def test_shutdown_cleanup_failure_does_not_skip_finalization(self, popen):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = LoggingSettings(log_dir=Path(directory))
+            backend = Mock(pid=101)
+            frontend = Mock(pid=102)
+            backend.poll.side_effect = [None, 1]
+            frontend.poll.return_value = None
+            frontend.wait.return_value = 0
+            frontend.stdout = iter([])
+            popen.side_effect = [backend, frontend]
+            terminal = io.StringIO()
+            with patch(
+                "backend.dev_runner.cleanup_logs",
+                side_effect=[[], OSError("OPENROUTER_API_KEY=shutdown-secret")],
+            ), contextlib.redirect_stderr(terminal):
+                try:
+                    result = run(settings=settings, poll_interval=0)
+                except Exception as error:  # Establish RED without letting the test error.
+                    result = error
+
+            self.assertEqual(result, 1)
+            manifest_text = next(Path(directory).glob("runs/*/manifest.json")).read_text()
+            self.assertIn('\"status\": \"unclean\"', manifest_text)
+            self.assertNotIn("shutdown-secret", terminal.getvalue())
+            self.assertNotIn("shutdown-secret", manifest_text)
 
     @patch("backend.dev_runner.subprocess.Popen")
     def test_frontend_start_failure_stops_backend_once_and_sanitizes_manifest(
@@ -127,22 +225,34 @@ class ChildConfigurationTests(unittest.TestCase):
         self.assertEqual(frontend.cwd, root / "frontend")
         self.assertTrue(frontend.capture_output)
 
-    def test_child_environment_contains_run_context_but_no_vite_secret(self):
+    def test_frontend_environment_is_allowlisted_and_contains_only_approved_vite_settings(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = LoggingSettings(log_dir=Path(directory))
             context = create_run_context(settings)
-            with patch.dict("os.environ", {"OPENROUTER_API_KEY": "secret-marker"}):
+            with patch.dict(
+                "os.environ",
+                {
+                    "PATH": "/runtime/bin",
+                    "HOME": "/runtime/home",
+                    "TMPDIR": "/runtime/tmp",
+                    "OPENROUTER_API_KEY": "openrouter-secret",
+                    "ARBITRARY_SECRET": "arbitrary-secret",
+                    "VITE_UNAPPROVED": "unapproved-value",
+                },
+                clear=True,
+            ):
                 environment = build_child_environment(settings, context)
-            self.assertEqual(environment["LLM_COUNCIL_RUN_ID"], context.run_id)
+            self.assertEqual(environment["PATH"], "/runtime/bin")
+            self.assertEqual(environment["HOME"], "/runtime/home")
+            self.assertEqual(environment["TMPDIR"], "/runtime/tmp")
+            self.assertNotIn("OPENROUTER_API_KEY", environment)
+            self.assertNotIn("ARBITRARY_SECRET", environment)
+            self.assertNotIn("VITE_UNAPPROVED", environment)
             self.assertEqual(
-                environment["LLM_COUNCIL_RUN_DIR"], str(context.run_dir.resolve())
+                {key for key in environment if key.startswith("VITE_")},
+                set(dev_runner.APPROVED_VITE_SETTINGS),
             )
-            vite_values = {
-                key: value
-                for key, value in environment.items()
-                if key.startswith("VITE_")
-            }
-            self.assertNotIn("secret-marker", repr(vite_values))
+            self.assertEqual(environment["VITE_LOG_BROWSER_BATCH_SIZE"], "20")
 
 
 class ShutdownTests(unittest.TestCase):
