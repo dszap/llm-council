@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -23,6 +24,15 @@ SENSITIVE_KEYS = re.compile(
 )
 TOKEN_VALUE = re.compile(
     r"(?i)(?:bearer\s+\S+|sk-(?:or-)?[a-z0-9_-]*[a-z0-9_-]{8,}|eyJ[a-z0-9_-]{10,}\.[a-z0-9_-]+\.[a-z0-9_-]+)"
+)
+INLINE_CREDENTIAL_VALUE = re.compile(
+    r"""(?ix)
+    (?P<prefix>
+        \b(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|password|secret|token|api[_-]?key)\b
+        \s*(?:[:=]\s*|\s+)(?:(?:basic|bearer)\s+)?
+    )
+    (?P<secret>"[^"]*"|'[^']*'|[^\s,;]+)
+    """
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -111,7 +121,7 @@ def redact(value: Any) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [redact(item) for item in value]
     if isinstance(value, str):
-        return _clean_string(TOKEN_VALUE.sub("[REDACTED]", value))
+        return _redact_string(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return redact(repr(value))
@@ -131,7 +141,6 @@ class JsonLineFormatter(logging.Formatter):
         self.event_max_bytes = event_max_bytes
 
     def format(self, record: logging.LogRecord) -> str:
-        fields = _truncate_fields(redact(getattr(record, "event_fields", {})), self.event_max_bytes)
         timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(
             timespec="milliseconds"
         ).replace("+00:00", "Z")
@@ -149,11 +158,19 @@ class JsonLineFormatter(logging.Formatter):
             payload["exception"] = redact(self.formatException(record.exc_info))
         elif record.exc_text:
             payload["exception"] = redact(record.exc_text)
+        fields = redact(getattr(record, "event_fields", {}))
         if isinstance(fields, Mapping):
             for key, value in fields.items():
                 if key not in payload:
                     payload[key] = value
-        return json.dumps(redact(payload), ensure_ascii=False, separators=(",", ":"), default=str)
+        safe_payload = _normalize_non_finite(_truncate_fields(redact(payload), self.event_max_bytes))
+        return json.dumps(
+            safe_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+            allow_nan=False,
+        )
 
 
 class ConsoleFormatter(logging.Formatter):
@@ -185,7 +202,7 @@ def _settings_from_mapping(values: Mapping[str, str], warning_sink: Callable[[st
         max_bytes=_parse_positive_int(values, "LOG_MAX_BYTES", defaults.max_bytes, warning_sink),
         retention_days=_parse_positive_int(values, "LOG_RETENTION_DAYS", defaults.retention_days, warning_sink),
         total_max_bytes=_parse_positive_int(values, "LOG_TOTAL_MAX_BYTES", defaults.total_max_bytes, warning_sink),
-        log_llm_payloads=_parse_bool(values, "LOG_LLM_PAYLOADS", defaults.log_llm_payloads, warning_sink),
+        log_llm_payloads=_parse_payload_logging(values, "LOG_LLM_PAYLOADS", warning_sink),
         browser_batch_size=_parse_positive_int(values, "LOG_BROWSER_BATCH_SIZE", defaults.browser_batch_size, warning_sink),
         browser_flush_ms=_parse_positive_int(values, "LOG_BROWSER_FLUSH_MS", defaults.browser_flush_ms, warning_sink),
         browser_queue_limit=_parse_positive_int(values, "LOG_BROWSER_QUEUE_LIMIT", defaults.browser_queue_limit, warning_sink),
@@ -232,6 +249,18 @@ def _parse_bool(values: Mapping[str, str], name: str, default: bool, warning_sin
     return default
 
 
+def _parse_payload_logging(values: Mapping[str, str], name: str, warning_sink: Callable[[str], None]) -> bool:
+    value = values.get(name)
+    if value is None:
+        return False
+    normalized = str(value).strip().lower()
+    if normalized == "true":
+        return True
+    if normalized != "false":
+        _warn_invalid(name, warning_sink)
+    return False
+
+
 def _parse_path(values: Mapping[str, str], name: str, default: Path, warning_sink: Callable[[str], None]) -> Path:
     value = values.get(name)
     if value is None:
@@ -252,18 +281,51 @@ def _truncate_fields(value: Any, max_bytes: int) -> Any:
         result: dict[str, Any] = {}
         for key, item in value.items():
             safe_key = str(key)
-            if isinstance(item, str):
-                shortened, was_truncated, original_bytes = truncate_utf8(item, max_bytes)
-                result[safe_key] = shortened
-                if was_truncated:
-                    result[f"{safe_key}_truncated"] = True
-                    result[f"{safe_key}_original_bytes"] = original_bytes
-            else:
-                result[safe_key] = _truncate_fields(item, max_bytes)
+            shortened, was_truncated, original_bytes = _truncate_value(item, max_bytes)
+            result[safe_key] = shortened
+            if was_truncated:
+                result[f"{safe_key}_truncated"] = True
+                result[f"{safe_key}_original_bytes"] = original_bytes
         return result
     if isinstance(value, list):
-        return [_truncate_fields(item, max_bytes) for item in value]
+        return [_truncate_value(item, max_bytes)[0] for item in value]
     return value
+
+
+def _truncate_value(value: Any, max_bytes: int) -> tuple[Any, bool, int | None]:
+    if isinstance(value, str):
+        return truncate_utf8(value, max_bytes)
+    if isinstance(value, Mapping):
+        return _truncate_fields(value, max_bytes), False, None
+    if isinstance(value, list):
+        items = []
+        was_truncated = False
+        original_bytes = 0
+        for item in value:
+            shortened, item_was_truncated, item_original_bytes = _truncate_value(item, max_bytes)
+            items.append(shortened)
+            was_truncated = was_truncated or item_was_truncated
+            if item_original_bytes is not None:
+                original_bytes += item_original_bytes
+        return items, was_truncated, original_bytes if was_truncated else None
+    return value, False, None
+
+
+def _normalize_non_finite(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _normalize_non_finite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_non_finite(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _redact_string(value: str) -> str:
+    without_inline_credentials = INLINE_CREDENTIAL_VALUE.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]", value
+    )
+    return _clean_string(TOKEN_VALUE.sub("[REDACTED]", without_inline_credentials))
 
 
 def _clean_string(value: str) -> str:

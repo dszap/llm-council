@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from backend.logging_config import (
+    ConsoleFormatter,
     JsonLineFormatter,
     LoggingSettings,
     bind_log_context,
@@ -35,6 +36,17 @@ class LoggingSettingsTests(unittest.TestCase):
         self.assertEqual(settings.max_bytes, 10 * 1024 * 1024)
         self.assertEqual(settings.browser_level, "WARNING")
         self.assertEqual(len(warnings), 2)
+
+    def test_payload_logging_only_accepts_literal_true(self):
+        warnings = []
+        for value in ("1", "yes", "on"):
+            settings = LoggingSettings.from_env(
+                {"LOG_LLM_PAYLOADS": value}, warning_sink=warnings.append
+            )
+            self.assertFalse(settings.log_llm_payloads)
+        self.assertEqual(len(warnings), 3)
+        self.assertTrue(all(value not in " ".join(warnings) for value in ("1", "yes", "on")))
+        self.assertTrue(LoggingSettings.from_env({"LOG_LLM_PAYLOADS": "TRUE"}).log_llm_payloads)
 
 
 class RedactionTests(unittest.TestCase):
@@ -69,6 +81,103 @@ class RedactionTests(unittest.TestCase):
         logger.setLevel(logging.INFO)
         log_event(logger, logging.INFO, "test.completed", "Bearer secret-value")
         self.assertNotIn("secret-value", records[0].getMessage())
+
+    def test_redacts_inline_credentials_from_messages_exceptions_and_formatters(self):
+        secret_values = ("pass-value", "cookie-value", "basic-value", "key-value", "secret-value")
+        text = (
+            "password=pass-value Cookie: cookie-value Authorization: Basic basic-value "
+            "api_key=key-value secret: secret-value"
+        )
+        self.assertTrue(all(value not in redact(text) for value in secret_values))
+
+        json_stream = io.StringIO()
+        console_stream = io.StringIO()
+        logger = logging.getLogger("test.logging.inline_credentials")
+        logger.handlers = [
+            logging.StreamHandler(json_stream),
+            logging.StreamHandler(console_stream),
+        ]
+        logger.handlers[0].setFormatter(JsonLineFormatter())
+        logger.handlers[1].setFormatter(ConsoleFormatter())
+        logger.propagate = False
+        logger.setLevel(logging.ERROR)
+        try:
+            raise RuntimeError(text)
+        except RuntimeError:
+            logger.exception(text)
+
+        combined = json_stream.getvalue() + console_stream.getvalue()
+        self.assertTrue(all(value not in combined for value in secret_values))
+        json.loads(json_stream.getvalue())
+
+    def test_json_formatter_normalizes_non_finite_floats(self):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(JsonLineFormatter())
+        logger = logging.getLogger("test.logging.non_finite")
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+        log_event(
+            logger,
+            logging.INFO,
+            "metrics.completed",
+            "Measured",
+            nan=float("nan"),
+            positive=float("inf"),
+            negative=float("-inf"),
+        )
+        payload = json.loads(stream.getvalue())
+        self.assertIsNone(payload["nan"])
+        self.assertIsNone(payload["positive"])
+        self.assertIsNone(payload["negative"])
+        self.assertNotIn("NaN", stream.getvalue())
+
+    def test_json_formatter_truncates_every_serialized_string(self):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(JsonLineFormatter(run_id="run-identifier", event_max_bytes=8))
+        logger = logging.getLogger("test.logging.truncation")
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.ERROR)
+        tokens = bind_log_context(
+            request_id="request-identifier", conversation_id="conversation-identifier"
+        )
+        try:
+            try:
+                raise RuntimeError("exception-is-longer-than-eight-bytes")
+            except RuntimeError:
+                logger.exception(
+                    "message-is-longer-than-eight-bytes",
+                    extra={
+                        "event_name": "event-is-longer-than-eight-bytes",
+                        "event_fields": {
+                            "outer": {"nested": "nested-is-longer-than-eight-bytes"},
+                            "items": ["item-is-longer-than-eight-bytes"],
+                        },
+                    },
+                )
+        finally:
+            reset_log_context(tokens)
+
+        payload = json.loads(stream.getvalue())
+        self.assertTrue(payload["message_truncated"])
+        self.assertTrue(payload["exception_truncated"])
+        self.assertTrue(payload["outer"]["nested_truncated"])
+        self.assertTrue(payload["items_truncated"])
+        self.assertLessEqual(len(payload["items"][0].encode("utf-8")), 8)
+        self._assert_string_values_within(payload, 8)
+
+    def _assert_string_values_within(self, value, max_bytes):
+        if isinstance(value, dict):
+            for item in value.values():
+                self._assert_string_values_within(item, max_bytes)
+        elif isinstance(value, list):
+            for item in value:
+                self._assert_string_values_within(item, max_bytes)
+        elif isinstance(value, str):
+            self.assertLessEqual(len(value.encode("utf-8")), max_bytes)
 
 
 class JsonFormatterTests(unittest.TestCase):
