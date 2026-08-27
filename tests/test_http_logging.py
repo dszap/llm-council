@@ -179,20 +179,35 @@ class HttpLoggingTests(unittest.TestCase):
         exact_size = len(
             BrowserLogBatch.model_validate({"events": [event]}).model_dump_json().encode("utf-8")
         )
-        with patch.dict(os.environ, {"LOG_EVENT_MAX_BYTES": str(exact_size)}):
-            accepted = self.client.post(
-                "/api/logs/browser",
-                headers={"Origin": "http://localhost:5173"},
-                json={"events": [event]},
-            )
-        with patch.dict(os.environ, {"LOG_EVENT_MAX_BYTES": str(exact_size - 1)}):
-            rejected = self.client.post(
-                "/api/logs/browser",
-                headers={"Origin": "http://localhost:5173"},
-                json={"events": [event]},
-            )
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger("llm_council.browser")
+        original_handlers = logger.handlers[:]
+        original_level = logger.level
+        original_propagate = logger.propagate
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG)
+        try:
+            with patch.dict(os.environ, {"LOG_EVENT_MAX_BYTES": str(exact_size)}):
+                accepted = self.client.post(
+                    "/api/logs/browser",
+                    headers={"Origin": "http://localhost:5173"},
+                    json={"events": [event]},
+                )
+            with patch.dict(os.environ, {"LOG_EVENT_MAX_BYTES": str(exact_size - 1)}):
+                rejected = self.client.post(
+                    "/api/logs/browser",
+                    headers={"Origin": "http://localhost:5173"},
+                    json={"events": [event]},
+                )
+        finally:
+            logger.handlers = original_handlers
+            logger.setLevel(original_level)
+            logger.propagate = original_propagate
         self.assertEqual(accepted.status_code, 202)
         self.assertEqual(rejected.status_code, 413)
+        self.assertIn("bounded", stream.getvalue())
 
     def test_conversation_route_binds_request_and_conversation_ids(self):
         stream = io.StringIO()
