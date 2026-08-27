@@ -15,6 +15,9 @@ wheels/
 # Data files
 data/
 
+# Runtime logs
+logs/
+
 # Frontend
 frontend/node_modules/
 frontend/dist/
