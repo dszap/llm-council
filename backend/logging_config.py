@@ -283,18 +283,19 @@ def retention_lock(log_dir: Path):
 
 def create_run_context(settings: LoggingSettings, now: datetime | None = None) -> RunContext:
     current = now or datetime.now(timezone.utc)
-    run_id = current.astimezone(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    base_run_id = current.astimezone(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     runs_dir = settings.log_dir / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     suffix = 0
     while True:
-        directory_name = run_id if suffix == 0 else f"{run_id}-{suffix}"
+        directory_name = base_run_id if suffix == 0 else f"{base_run_id}-{suffix}"
         run_dir = runs_dir / directory_name
         try:
             run_dir.mkdir()
             break
         except FileExistsError:
             suffix += 1
+    run_id = directory_name
     latest = settings.log_dir / "latest"
     temporary = settings.log_dir / f".latest.{uuid.uuid4().hex}.tmp"
     try:

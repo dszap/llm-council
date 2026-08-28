@@ -147,7 +147,9 @@ The supervisor, rather than shell background jobs, owns process cleanup and exit
 
 ## Run Layout and Discovery
 
-Each run uses a filesystem-safe UTC identifier without colons:
+Each run uses a filesystem-safe UTC identifier without colons. The normal run
+ID is `YYYY-MM-DDTHHMMSSZ`; if that directory already exists, the allocated run
+ID and directory name become `YYYY-MM-DDTHHMMSSZ-1`, then `-2`, and so on:
 
 ```text
 logs/

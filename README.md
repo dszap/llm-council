@@ -88,8 +88,10 @@ Start the local supervisor with:
 ```
 
 Every run gets its own UTC directory under `logs/runs/`; `logs/latest` is an
-atomic symlink to the active or most recent run. Each run contains a manifest
-and one JSON Lines source per component:
+atomic symlink to the active or most recent run. Run IDs normally use
+`YYYY-MM-DDTHHMMSSZ`; if the same-second directory already exists, the run ID
+and directory name become `YYYY-MM-DDTHHMMSSZ-1`, then `-2`, and so on. Each
+run contains a manifest and one JSON Lines source per component:
 
 ```text
 logs/

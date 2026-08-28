@@ -45,30 +45,30 @@ class RunContextTests(unittest.TestCase):
             self.assertTrue(context.run_dir.is_dir())
             self.assertEqual(context.latest_link.resolve(), context.run_dir.resolve())
 
-    def test_collision_suffixes_directory_but_preserves_timestamp_run_id(self):
+    def test_collision_suffixes_directory_and_run_id(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = replace(LoggingSettings(), log_dir=Path(directory))
             now = datetime(2026, 8, 26, 22, 7, 12, tzinfo=timezone.utc)
             first = create_run_context(settings, now=now)
             second = create_run_context(settings, now=now)
             self.assertEqual(first.run_id, "2026-08-26T220712Z")
-            self.assertEqual(second.run_id, "2026-08-26T220712Z")
+            self.assertEqual(second.run_id, "2026-08-26T220712Z-1")
             self.assertEqual(first.run_dir.name, "2026-08-26T220712Z")
             self.assertEqual(second.run_dir.name, "2026-08-26T220712Z-1")
 
-    def test_concurrent_creation_allocates_unique_directories_and_temp_links(self):
+    def test_concurrent_creation_allocates_unique_run_ids_directories_and_temp_links(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = replace(LoggingSettings(), log_dir=root)
             now = datetime(2026, 8, 26, 22, 7, 12, tzinfo=timezone.utc)
-            run_id = "2026-08-26T220712Z"
+            base_run_id = "2026-08-26T220712Z"
             directory_barrier = threading.Barrier(2)
             link_barrier = threading.Barrier(2)
             original_mkdir = Path.mkdir
             original_symlink_to = Path.symlink_to
 
             def synchronized_mkdir(path, *args, **kwargs):
-                if path.parent.name == "runs" and path.name == run_id:
+                if path.parent.name == "runs" and path.name == base_run_id:
                     directory_barrier.wait(timeout=2)
                 return original_mkdir(path, *args, **kwargs)
 
@@ -88,7 +88,12 @@ class RunContextTests(unittest.TestCase):
 
             self.assertEqual(errors, [None, None])
             contexts = [future.result() for future in futures]
+            self.assertEqual(
+                {context.run_id for context in contexts},
+                {base_run_id, f"{base_run_id}-1"},
+            )
             self.assertEqual(len({context.run_dir for context in contexts}), 2)
+            self.assertEqual({context.run_dir.name for context in contexts}, {context.run_id for context in contexts})
             self.assertTrue(all(context.run_dir.is_dir() for context in contexts))
             self.assertIn(
                 (root / "latest").resolve(),
