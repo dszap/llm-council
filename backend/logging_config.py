@@ -503,12 +503,39 @@ def _active_rotated_segments(current_run_dir: Path) -> list[Path]:
 
 def _settings_from_mapping(values: Mapping[str, str], warning_sink: Callable[[str], None]) -> LoggingSettings:
     defaults = LoggingSettings()
+    general_level = _parse_level(values, "LOG_LEVEL", defaults.level, warning_sink)
+    general_value = values.get("LOG_LEVEL")
+    general_override = (
+        general_level
+        if general_value is not None and str(general_value).upper() in VALID_LEVELS
+        else None
+    )
     return LoggingSettings(
-        level=_parse_level(values, "LOG_LEVEL", defaults.level, warning_sink),
-        backend_level=_parse_level(values, "LOG_BACKEND_LEVEL", defaults.backend_level, warning_sink),
-        uvicorn_level=_parse_level(values, "LOG_UVICORN_LEVEL", defaults.uvicorn_level, warning_sink),
-        vite_level=_parse_level(values, "LOG_VITE_LEVEL", defaults.vite_level, warning_sink),
-        browser_level=_parse_level(values, "LOG_BROWSER_LEVEL", defaults.browser_level, warning_sink),
+        level=general_level,
+        backend_level=_parse_level(
+            values,
+            "LOG_BACKEND_LEVEL",
+            defaults.backend_level if general_override is None else general_override,
+            warning_sink,
+        ),
+        uvicorn_level=_parse_level(
+            values,
+            "LOG_UVICORN_LEVEL",
+            defaults.uvicorn_level if general_override is None else general_override,
+            warning_sink,
+        ),
+        vite_level=_parse_level(
+            values,
+            "LOG_VITE_LEVEL",
+            defaults.vite_level if general_override is None else general_override,
+            warning_sink,
+        ),
+        browser_level=_parse_level(
+            values,
+            "LOG_BROWSER_LEVEL",
+            defaults.browser_level if general_override is None else general_override,
+            warning_sink,
+        ),
         log_dir=_parse_path(values, "LOG_DIR", defaults.log_dir, warning_sink),
         max_bytes=_parse_positive_int(values, "LOG_MAX_BYTES", defaults.max_bytes, warning_sink),
         retention_days=_parse_positive_int(values, "LOG_RETENTION_DAYS", defaults.retention_days, warning_sink),

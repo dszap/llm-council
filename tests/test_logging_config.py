@@ -20,12 +20,55 @@ class LoggingSettingsTests(unittest.TestCase):
     def test_defaults_match_specification(self):
         settings = LoggingSettings.from_env({})
         self.assertEqual(settings.level, "INFO")
+        self.assertEqual(settings.backend_level, "INFO")
+        self.assertEqual(settings.uvicorn_level, "INFO")
+        self.assertEqual(settings.vite_level, "INFO")
         self.assertEqual(settings.browser_level, "WARNING")
         self.assertEqual(settings.max_bytes, 10 * 1024 * 1024)
         self.assertEqual(settings.retention_days, 14)
         self.assertEqual(settings.total_max_bytes, 500 * 1024 * 1024)
         self.assertFalse(settings.log_llm_payloads)
         self.assertEqual(settings.log_dir, Path("logs"))
+
+    def test_valid_general_level_is_inherited_by_sources(self):
+        settings = LoggingSettings.from_env({"LOG_LEVEL": "debug"})
+
+        self.assertEqual(settings.level, "DEBUG")
+        self.assertEqual(settings.backend_level, "DEBUG")
+        self.assertEqual(settings.uvicorn_level, "DEBUG")
+        self.assertEqual(settings.vite_level, "DEBUG")
+        self.assertEqual(settings.browser_level, "DEBUG")
+
+    def test_valid_source_levels_override_general_level(self):
+        settings = LoggingSettings.from_env(
+            {
+                "LOG_LEVEL": "ERROR",
+                "LOG_BACKEND_LEVEL": "DEBUG",
+                "LOG_UVICORN_LEVEL": "WARNING",
+                "LOG_VITE_LEVEL": "CRITICAL",
+                "LOG_BROWSER_LEVEL": "INFO",
+            }
+        )
+
+        self.assertEqual(settings.level, "ERROR")
+        self.assertEqual(settings.backend_level, "DEBUG")
+        self.assertEqual(settings.uvicorn_level, "WARNING")
+        self.assertEqual(settings.vite_level, "CRITICAL")
+        self.assertEqual(settings.browser_level, "INFO")
+
+    def test_invalid_general_level_preserves_source_defaults_and_hides_value(self):
+        warnings = []
+        settings = LoggingSettings.from_env(
+            {"LOG_LEVEL": "not-a-level"}, warning_sink=warnings.append
+        )
+
+        self.assertEqual(settings.level, "INFO")
+        self.assertEqual(settings.backend_level, "INFO")
+        self.assertEqual(settings.uvicorn_level, "INFO")
+        self.assertEqual(settings.vite_level, "INFO")
+        self.assertEqual(settings.browser_level, "WARNING")
+        self.assertEqual(len(warnings), 1)
+        self.assertNotIn("not-a-level", warnings[0])
 
     def test_invalid_values_fall_back_and_report_warnings(self):
         warnings = []
