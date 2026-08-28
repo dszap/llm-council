@@ -267,6 +267,86 @@ test('keeps a nonempty message when truncating an oversized event', async () => 
   assert.ok(new TextEncoder().encode(JSON.stringify(sent[0])).byteLength <= 256);
 });
 
+test('caps browser messages to the backend field limit before transport', async () => {
+  const sent = [];
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject: createFakeWindow(),
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log('ERROR', 'oversized.message', 'x'.repeat(5000));
+  await logger.flush();
+
+  assert.equal(sent[0].events[0].message, 'x'.repeat(4096));
+  assert.equal(sent[0].events[0].message.length, 4096);
+});
+
+test('caps browser pages to the backend field limit before transport', async () => {
+  const sent = [];
+  const windowObject = createFakeWindow();
+  windowObject.location.href = `https://council.example/${'x'.repeat(3000)}?token=secret-value#fragment`;
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject,
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log('ERROR', 'oversized.page', 'failure');
+  await logger.flush();
+
+  assert.equal(
+    sent[0].events[0].page,
+    `https://council.example/${'x'.repeat(3000)}`.slice(0, 2048),
+  );
+  assert.equal(sent[0].events[0].page.length, 2048);
+});
+
+test('caps browser details to 31 entries plus a truncation marker before transport', async () => {
+  const sent = [];
+  const details = Object.fromEntries(
+    Array.from({ length: 33 }, (_, index) => [`detail${index}`, `value${index}`]),
+  );
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject: createFakeWindow(),
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log('ERROR', 'oversized.details', 'failure', details);
+  await logger.flush();
+
+  assert.deepEqual(
+    Object.keys(sent[0].events[0].details),
+    [...Array.from({ length: 31 }, (_, index) => `detail${index}`), 'truncated'],
+  );
+  assert.equal(sent[0].events[0].details.truncated, true);
+});
+
 test('canonicalizes browser sensitive keys with spaces and hyphens', async () => {
   const sent = [];
   const logger = createBrowserLogger({

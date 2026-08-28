@@ -5,6 +5,9 @@ const BEARER_VALUE = /(?<prefix>\bbearer\s+)\S+/gi;
 const API_KEY_VALUE = /(?<prefix>sk-(?:or-)?)(?:[a-z0-9_-]{12,})/gi;
 const HEADER_VALUE = /(?<prefix>\b(?:proxy[\s-]*authorization|set[\s-]*cookie|authorization|cookie)\s*:\s*)[^\r\n]*/gi;
 const SEVERITY = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
+const BROWSER_MESSAGE_MAX_CHARS = 4096;
+const BROWSER_PAGE_MAX_CHARS = 2048;
+const BROWSER_DETAILS_MAX_KEYS = 32;
 
 function redactBrowserString(value) {
   return String(value)
@@ -29,12 +32,31 @@ function truncateBrowserText(value, maxBytes) {
 }
 
 function sanitizeBrowserPage(value) {
+  let sanitized;
   try {
     const url = new URL(value);
-    return `${url.origin}${url.pathname}`;
+    sanitized = `${url.origin}${url.pathname}`;
   } catch {
-    return String(value).split(/[?#]/, 1)[0];
+    sanitized = String(value).split(/[?#]/, 1)[0];
   }
+  return sanitized.slice(0, BROWSER_PAGE_MAX_CHARS) || '/';
+}
+
+function clampBrowserField(value, maxChars) {
+  const text = String(value);
+  return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+
+function clampBrowserDetails(details) {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return details;
+
+  const entries = Object.entries(details);
+  if (entries.length <= BROWSER_DETAILS_MAX_KEYS) return details;
+
+  return Object.fromEntries([
+    ...entries.slice(0, BROWSER_DETAILS_MAX_KEYS - 1),
+    ['truncated', true],
+  ]);
 }
 
 function serializedEventBytes(event) {
@@ -190,10 +212,10 @@ export function createBrowserLogger(options) {
       client_timestamp: now(),
       level: eventLevel,
       event,
-      message: safe.message || '[empty]',
+      message: clampBrowserField(safe.message || '[empty]', BROWSER_MESSAGE_MAX_CHARS),
       browser_session_id: sessionId,
       page: sanitizeBrowserPage(windowObject.location.href),
-      details: safe.details,
+      details: clampBrowserDetails(safe.details),
     }, eventMaxBytes);
   }
 
