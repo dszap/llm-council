@@ -49,6 +49,36 @@ class ViteStreamingTests(unittest.TestCase):
 
 class SupervisorTests(unittest.TestCase):
     @patch("backend.dev_runner.subprocess.Popen")
+    def test_records_supervisor_pid_in_starting_manifest_before_children_launch(self, popen):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = LoggingSettings(log_dir=Path(directory))
+            backend = Mock(pid=101)
+            frontend = Mock(pid=102)
+            backend.poll.side_effect = [None, 1]
+            frontend.poll.return_value = None
+            frontend.stdout = iter([])
+            startup_manifest = {}
+
+            def popen_side_effect(*args, **kwargs):
+                if not startup_manifest:
+                    manifest_path = next(Path(directory).glob("runs/*/manifest.json"))
+                    startup_manifest.update(json.loads(manifest_path.read_text()))
+                if len(popen.mock_calls) == 1:
+                    return backend
+                return frontend
+
+            popen.side_effect = popen_side_effect
+            with patch.dict(
+                "os.environ", {"OPENROUTER_API_KEY": "startup-secret"}, clear=False
+            ):
+                result = run(settings=settings, poll_interval=0)
+
+            self.assertNotEqual(result, 0)
+            self.assertEqual(startup_manifest["status"], "starting")
+            self.assertEqual(startup_manifest["supervisor_pid"], os.getpid())
+            self.assertNotIn("OPENROUTER_API_KEY", json.dumps(startup_manifest))
+
+    @patch("backend.dev_runner.subprocess.Popen")
     def test_loads_logging_settings_from_repository_env_before_start(self, popen):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

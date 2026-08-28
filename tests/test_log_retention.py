@@ -324,7 +324,43 @@ class RetentionTests(unittest.TestCase):
                 self.assertFalse(malformed.exists())
                 self.assertTrue(any(action.reason == "expired" for action in actions))
 
-    def test_preserves_another_run_that_is_still_running_after_latest_rollover(self):
+    def test_deletes_expired_running_manifest_without_a_live_recorded_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = replace(LoggingSettings(), log_dir=root, retention_days=1)
+            abandoned = root / "runs" / "2026-01-01T000000Z"
+            abandoned.mkdir(parents=True)
+            (abandoned / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "supervisor_pid": 41001,
+                        "children": {"backend": {"pid": -1}, "frontend": {"pid": "oops"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            current = create_run_context(
+                settings, now=datetime(2026, 8, 26, tzinfo=timezone.utc)
+            ).run_dir
+
+            def fake_kill(pid, signal_number):
+                self.assertEqual(signal_number, 0)
+                raise ProcessLookupError(pid)
+
+            with patch("backend.logging_config.os.kill", side_effect=fake_kill):
+                actions = cleanup_logs(
+                    settings,
+                    current,
+                    now=datetime(2026, 8, 26, tzinfo=timezone.utc),
+                )
+
+            self.assertFalse(abandoned.exists())
+            self.assertTrue(
+                any(action.path == str(abandoned) and action.reason == "expired" for action in actions)
+            )
+
+    def test_preserves_another_run_that_is_still_running_with_a_live_recorded_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = replace(LoggingSettings(), log_dir=root, retention_days=1)
@@ -332,16 +368,30 @@ class RetentionTests(unittest.TestCase):
                 settings, now=datetime(2026, 1, 1, tzinfo=timezone.utc)
             )
             (first.run_dir / "manifest.json").write_text(
-                json.dumps({"status": "running"}), encoding="utf-8"
+                json.dumps(
+                    {
+                        "status": "running",
+                        "supervisor_pid": -1,
+                        "children": {"frontend": {"pid": 52002}},
+                    }
+                ),
+                encoding="utf-8",
             )
             second = create_run_context(
                 settings, now=datetime(2026, 8, 26, tzinfo=timezone.utc)
             )
-            actions = cleanup_logs(
-                settings,
-                second.run_dir,
-                now=datetime(2026, 8, 26, tzinfo=timezone.utc),
-            )
+            def fake_kill(pid, signal_number):
+                self.assertEqual(signal_number, 0)
+                if pid == 52002:
+                    raise PermissionError(pid)
+                raise ProcessLookupError(pid)
+
+            with patch("backend.logging_config.os.kill", side_effect=fake_kill):
+                actions = cleanup_logs(
+                    settings,
+                    second.run_dir,
+                    now=datetime(2026, 8, 26, tzinfo=timezone.utc),
+                )
             self.assertTrue(first.run_dir.exists())
             self.assertFalse(any(action.path == str(first.run_dir) for action in actions))
 

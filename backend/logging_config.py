@@ -448,9 +448,47 @@ def _active_run_identities(runs_dir: Path) -> set[Path]:
             continue
         if not isinstance(manifest, Mapping):
             continue
-        if manifest.get("status") in {"starting", "running"} and not manifest.get("ended_at"):
+        if (
+            manifest.get("status") in {"starting", "running"}
+            and not manifest.get("ended_at")
+            and _manifest_has_live_owner(manifest)
+        ):
             active.add(_path_identity(run_dir))
     return active
+
+
+def _manifest_has_live_owner(manifest: Mapping[str, Any]) -> bool:
+    owner_pids: list[int] = []
+    supervisor_pid = manifest.get("supervisor_pid")
+    if _is_positive_pid(supervisor_pid):
+        owner_pids.append(supervisor_pid)
+
+    children = manifest.get("children")
+    if isinstance(children, Mapping):
+        for child in children.values():
+            if not isinstance(child, Mapping):
+                continue
+            pid = child.get("pid")
+            if _is_positive_pid(pid):
+                owner_pids.append(pid)
+
+    return any(_pid_is_alive(pid) for pid in owner_pids)
+
+
+def _is_positive_pid(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _run_timestamp(run_dir: Path) -> datetime:

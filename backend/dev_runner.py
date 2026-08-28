@@ -245,6 +245,7 @@ def run(
         "run_id": context.run_id,
         "started_at": utc_timestamp(),
         "status": "starting",
+        "supervisor_pid": os.getpid(),
         "repository_root": str(REPO_ROOT.resolve()),
         "settings": effective.to_safe_dict(),
         "services": {
