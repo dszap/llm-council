@@ -388,6 +388,28 @@ test('redacts dotted and JWT-like bearer credentials before transport', async ()
   assert.doesNotMatch(JSON.stringify(sent), /secret\.with\.dot|payload|signature/);
 });
 
+test('preserves bearer text embedded in a larger word', async () => {
+  const sent = [];
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject: createFakeWindow(),
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log('WARNING', 'diagnostic.message', 'notBearer ordinary-text');
+  await logger.flush();
+
+  assert.equal(sent[0].events[0].message, 'notBearer ordinary-text');
+});
+
 test('stop restores console and transport rejection is contained', async () => {
   const originalErrors = [];
   const originalError = (...args) => originalErrors.push(args);
