@@ -359,6 +359,35 @@ test('redacts complete standalone bearer and API-key credentials before transpor
   assert.doesNotMatch(message, /bearer-secret|api-secret/);
 });
 
+test('redacts dotted and JWT-like bearer credentials before transport', async () => {
+  const sent = [];
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject: createFakeWindow(),
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log('ERROR', 'credential.dotted', 'Bearer secret.with.dot');
+  logger.log(
+    'ERROR',
+    'credential.jwt',
+    'Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature',
+  );
+  await logger.flush();
+
+  const messages = sent[0].events.map((event) => event.message);
+  assert.deepEqual(messages, ['Bearer [REDACTED]', 'Bearer [REDACTED]']);
+  assert.doesNotMatch(JSON.stringify(sent), /secret\.with\.dot|payload|signature/);
+});
+
 test('stop restores console and transport rejection is contained', async () => {
   const originalErrors = [];
   const originalError = (...args) => originalErrors.push(args);

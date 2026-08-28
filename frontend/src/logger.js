@@ -1,7 +1,8 @@
 import { API_BASE } from './api.js';
 
 const SENSITIVE_KEY = /authorization|proxyauthorization|cookie|setcookie|password|secret|token|apikey/i;
-const TOKEN_VALUE = /(?<prefix>bearer\s+|sk-(?:or-)?)(?:[a-z0-9_-]{12,})/gi;
+const BEARER_VALUE = /(?<prefix>bearer\s+)\S+/gi;
+const API_KEY_VALUE = /(?<prefix>sk-(?:or-)?)(?:[a-z0-9_-]{12,})/gi;
 const HEADER_VALUE = /(?<prefix>\b(?:proxy[\s-]*authorization|set[\s-]*cookie|authorization|cookie)\s*:\s*)[^\r\n]*/gi;
 const SEVERITY = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
 
@@ -11,7 +12,11 @@ function redactBrowserString(value) {
       const groups = args[args.length - 1];
       return `${groups.prefix}[REDACTED]`;
     })
-    .replace(TOKEN_VALUE, (...args) => {
+    .replace(BEARER_VALUE, (...args) => {
+      const groups = args[args.length - 1];
+      return `${groups.prefix}[REDACTED]`;
+    })
+    .replace(API_KEY_VALUE, (...args) => {
       const groups = args[args.length - 1];
       return `${groups.prefix}[REDACTED]`;
     });
