@@ -47,6 +47,12 @@ function clampBrowserField(value, maxChars) {
   return text.length <= maxChars ? text : text.slice(0, maxChars);
 }
 
+function browserFieldCharLimit(field) {
+  if (field === 'message') return BROWSER_MESSAGE_MAX_CHARS;
+  if (field === 'page') return BROWSER_PAGE_MAX_CHARS;
+  return Number.POSITIVE_INFINITY;
+}
+
 function clampBrowserDetails(details) {
   if (!details || typeof details !== 'object' || Array.isArray(details)) return details;
 
@@ -90,6 +96,7 @@ function compactEventField(event, field, eventMaxBytes) {
   const original = event[field];
   const originalBytes = new TextEncoder().encode(original).byteLength;
   const suffix = `[truncated:${originalBytes}]`;
+  const maxChars = browserFieldCharLimit(field);
   let low = 0;
   let high = original.length;
   let compacted = '';
@@ -102,7 +109,7 @@ function compactEventField(event, field, eventMaxBytes) {
     const middle = Math.floor((low + high) / 2);
     const candidate = middle === original.length
       ? original
-      : `${original.slice(0, middle)}${suffix}`;
+      : clampBrowserField(`${original.slice(0, middle)}${suffix}`, maxChars);
     event[field] = candidate;
     if (wrappedEventBytes(event) <= eventMaxBytes) {
       compacted = candidate;

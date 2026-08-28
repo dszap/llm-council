@@ -347,6 +347,33 @@ test('caps browser details to 31 entries plus a truncation marker before transpo
   assert.equal(sent[0].events[0].details.truncated, true);
 });
 
+test('preserves browser field caps after byte-budget compaction', async () => {
+  const sent = [];
+  const windowObject = createFakeWindow();
+  windowObject.location.href = `${'á'.repeat(3000)}?token=secret-value#fragment`;
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 4300,
+    windowObject,
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log('ERROR', 'post.clamp.compaction', 'á'.repeat(3000));
+  await logger.flush();
+
+  const event = sent[0].events[0];
+  assert.ok(event.message.length <= 4096);
+  assert.ok(event.page.length <= 2048);
+  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0])).byteLength <= 4300);
+});
+
 test('canonicalizes browser sensitive keys with spaces and hyphens', async () => {
   const sent = [];
   const logger = createBrowserLogger({
