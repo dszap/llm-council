@@ -39,12 +39,17 @@ function sanitizeBrowserPage(value) {
   } catch {
     sanitized = String(value).split(/[?#]/, 1)[0];
   }
-  return sanitized.slice(0, BROWSER_PAGE_MAX_CHARS) || '/';
+  return clampBrowserField(sanitized, BROWSER_PAGE_MAX_CHARS) || '/';
+}
+
+function sliceBrowserCodePoints(value, maxCodePoints) {
+  return Array.from(value).slice(0, maxCodePoints).join('');
 }
 
 function clampBrowserField(value, maxChars) {
   const text = String(value);
-  return text.length <= maxChars ? text : text.slice(0, maxChars);
+  const codePoints = Array.from(text);
+  return codePoints.length <= maxChars ? text : codePoints.slice(0, maxChars).join('');
 }
 
 function browserFieldCharLimit(field) {
@@ -94,11 +99,12 @@ function takeTransportBatch(queue, batchSize, eventMaxBytes) {
 
 function compactEventField(event, field, eventMaxBytes) {
   const original = event[field];
+  const originalCodePoints = Array.from(original);
   const originalBytes = new TextEncoder().encode(original).byteLength;
   const suffix = `[truncated:${originalBytes}]`;
   const maxChars = browserFieldCharLimit(field);
   let low = 0;
-  let high = original.length;
+  let high = originalCodePoints.length;
   let compacted = '';
 
   const fallback = field === 'page' ? '/' : '[truncated]';
@@ -107,9 +113,9 @@ function compactEventField(event, field, eventMaxBytes) {
 
   while (low <= high) {
     const middle = Math.floor((low + high) / 2);
-    const candidate = middle === original.length
+    const candidate = middle === originalCodePoints.length
       ? original
-      : clampBrowserField(`${original.slice(0, middle)}${suffix}`, maxChars);
+      : clampBrowserField(`${sliceBrowserCodePoints(original, middle)}${suffix}`, maxChars);
     event[field] = candidate;
     if (wrappedEventBytes(event) <= eventMaxBytes) {
       compacted = candidate;

@@ -435,7 +435,7 @@ def _completed_run_dirs(runs_dir: Path, protected_runs: set[Path]) -> list[Path]
 
 
 def _active_run_identities(runs_dir: Path) -> set[Path]:
-    """Return runs whose supervisor manifest has not recorded termination."""
+    """Return protected runs that still have a live recorded owner."""
     active: set[Path] = set()
     for run_dir in runs_dir.iterdir():
         if run_dir.is_symlink() or not run_dir.is_dir():
@@ -482,6 +482,8 @@ def _is_positive_pid(value: Any) -> bool:
 def _pid_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+    except OverflowError:
+        return False
     except ProcessLookupError:
         return False
     except PermissionError:

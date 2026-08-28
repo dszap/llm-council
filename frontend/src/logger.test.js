@@ -3,6 +3,25 @@ import test from 'node:test';
 
 import { createBrowserLogger } from './logger.js';
 
+function hasUnpairedSurrogates(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xDC00 && next <= 0xDFFF)) return true;
+      index += 1;
+      continue;
+    }
+    if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) return true;
+  }
+  return false;
+}
+
+function assertCodePointSafeField(value, maxCodePoints) {
+  assert.equal(hasUnpairedSurrogates(value), false);
+  assert.ok(Array.from(value).length <= maxCodePoints);
+}
+
 function createFakeWindow() {
   const listeners = new Map();
   return {
@@ -290,6 +309,34 @@ test('caps browser messages to the backend field limit before transport', async 
   assert.equal(sent[0].events[0].message.length, 4096);
 });
 
+test('caps astral-character browser message and page fields without splitting surrogate pairs', async () => {
+  const sent = [];
+  const windowObject = createFakeWindow();
+  windowObject.location.href = `/${'a'.repeat(2046)}😀?token=secret-value#fragment`;
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 65536,
+    windowObject,
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log('ERROR', 'astral.direct.cap', `${'a'.repeat(4095)}😀`);
+  await logger.flush();
+
+  const event = sent[0].events[0];
+  assert.equal(event.message, `${'a'.repeat(4095)}😀`);
+  assert.equal(event.page, `/${'a'.repeat(2046)}😀`);
+  assertCodePointSafeField(event.message, 4096);
+  assertCodePointSafeField(event.page, 2048);
+});
+
 test('caps browser pages to the backend field limit before transport', async () => {
   const sent = [];
   const windowObject = createFakeWindow();
@@ -372,6 +419,33 @@ test('preserves browser field caps after byte-budget compaction', async () => {
   assert.ok(event.message.length <= 4096);
   assert.ok(event.page.length <= 2048);
   assert.ok(new TextEncoder().encode(JSON.stringify(sent[0])).byteLength <= 4300);
+});
+
+test('preserves surrogate pairs when compacting astral browser fields to a low byte budget', async () => {
+  const sent = [];
+  const windowObject = createFakeWindow();
+  windowObject.location.href = `/${'a'.repeat(2046)}😀?token=secret-value#fragment`;
+  const logger = createBrowserLogger({
+    endpoint: '/api/logs/browser',
+    level: 'WARNING',
+    batchSize: 20,
+    flushMs: 2000,
+    queueLimit: 20,
+    eventMaxBytes: 5000,
+    windowObject,
+    consoleObject: { warn() {}, error() {}, log() {}, info() {}, debug() {} },
+    transport: async (endpoint, body) => sent.push(body),
+    now: () => '2026-08-26T22:07:12.438Z',
+    sessionId: 'session-1',
+  });
+
+  logger.log('ERROR', 'astral.compaction', `${'a'.repeat(4095)}😀`);
+  await logger.flush();
+
+  const event = sent[0].events[0];
+  assertCodePointSafeField(event.message, 4096);
+  assertCodePointSafeField(event.page, 2048);
+  assert.ok(new TextEncoder().encode(JSON.stringify(sent[0])).byteLength <= 5000);
 });
 
 test('canonicalizes browser sensitive keys with spaces and hyphens', async () => {

@@ -360,6 +360,38 @@ class RetentionTests(unittest.TestCase):
                 any(action.path == str(abandoned) and action.reason == "expired" for action in actions)
             )
 
+    def test_deletes_expired_active_manifest_with_oversized_positive_pid(self):
+        for status in ("starting", "running"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                settings = replace(LoggingSettings(), log_dir=root, retention_days=1)
+                abandoned = root / "runs" / "2026-01-01T000000Z"
+                abandoned.mkdir(parents=True)
+                (abandoned / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "status": status,
+                            "supervisor_pid": 10 ** 100,
+                            "children": {"backend": {"pid": "oops"}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                current = create_run_context(
+                    settings, now=datetime(2026, 8, 26, tzinfo=timezone.utc)
+                ).run_dir
+
+                actions = cleanup_logs(
+                    settings,
+                    current,
+                    now=datetime(2026, 8, 26, tzinfo=timezone.utc),
+                )
+
+                self.assertFalse(abandoned.exists())
+                self.assertTrue(
+                    any(action.path == str(abandoned) and action.reason == "expired" for action in actions)
+                )
+
     def test_preserves_another_run_that_is_still_running_with_a_live_recorded_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
